@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tracker Solaire - Tableau de bord</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0f14; --surface:#141b23; --surface2:#1b2530; --border:#26323f;
+    --text:#e8edf2; --text-muted:#8a97a6; --accent:#3b82f6;
+    --good:#22c55e; --warn:#f59e0b; --crit:#ef4444; --off:#3a4553;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg);z-index:5;}
+  header h1{font-size:16px;margin:0;font-weight:600;}
+  #connDot{width:10px;height:10px;border-radius:50%;background:var(--crit);display:inline-block;margin-right:6px;}
+  #connDot.ok{background:var(--good);}
+  #connDot.warn{background:var(--warn);}
+  #connLabel{font-size:12px;color:var(--text-muted);}
+  main{max-width:720px;margin:0 auto;padding:14px 12px 40px;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin:0 0 10px;font-weight:600;}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+  .tile{background:var(--surface2);border-radius:10px;padding:10px 8px;text-align:center;}
+  .tile .lbl{font-size:11px;color:var(--text-muted);margin-bottom:4px;}
+  .tile .val{font-size:18px;font-weight:700;}
+  .bar{height:5px;border-radius:3px;background:var(--off);margin-top:6px;overflow:hidden;}
+  .bar > span{display:block;height:100%;background:var(--good);}
+  .row{display:flex;gap:8px;flex-wrap:wrap;}
+  .btn{flex:1;min-width:90px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:12px 8px;font-size:13px;font-weight:600;text-align:center;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:manipulation;}
+  .btn:active{background:var(--accent);border-color:var(--accent);}
+  .btn.on{background:var(--accent);border-color:var(--accent);}
+  .btn.crit{background:var(--crit);border-color:var(--crit);color:#fff;}
+  .btn.crit:active{filter:brightness(1.15);}
+  .btn.armed{background:var(--warn);border-color:var(--warn);color:#1a1200;}
+  .btn:disabled{opacity:.35;cursor:not-allowed;}
+  .jogpad{display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr;gap:8px;max-width:280px;margin:0 auto;}
+  .jogpad .btn{padding:18px 8px;font-size:20px;}
+  .status-line{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px solid var(--border);}
+  .status-line:last-child{border-bottom:none;}
+  .status-line .k{color:var(--text-muted);}
+  .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;}
+  .badge.ok{background:rgba(34,197,94,.15);color:var(--good);}
+  .badge.crit{background:rgba(239,68,68,.15);color:var(--crit);}
+  .badge.off{background:rgba(138,151,166,.15);color:var(--text-muted);}
+  .forecast{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px;}
+  .forecast img{width:34px;height:34px;background:var(--surface2);border-radius:8px;}
+  .hint{font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.4;}
+  input[type=text],input[type=password],input[type=number]{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;font-size:14px;margin-bottom:8px;}
+  label{font-size:12px;color:var(--text-muted);display:block;margin-bottom:3px;}
+  #loginCard .btn{background:var(--accent);border-color:var(--accent);}
+  #dash{display:none;}
+  .weathericon{width:44px;height:44px;vertical-align:middle;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Tracker Solaire</h1>
+  <div><span id="connDot"></span><span id="connLabel">Non connecte</span></div>
+</header>
+
+<main>
+
+  <!-- Formulaire de connexion MQTT (identifiants du broker configure sur le tracker, Admin > Sans-fil) -->
+  <div class="card" id="loginCard">
+    <h2>Connexion MQTT (une seule fois)</h2>
+    <label for="fHost">Host (ex: xxxx.s1.eu.hivemq.cloud)</label>
+    <input type="text" id="fHost" placeholder="xxxx.s1.eu.hivemq.cloud">
+    <label for="fUser">Utilisateur</label>
+    <input type="text" id="fUser">
+    <label for="fPass">Mot de passe</label>
+    <input type="password" id="fPass">
+    <label for="fTopic">Topic (identique a celui du tracker)</label>
+    <input type="text" id="fTopic" placeholder="tracker/status">
+    <div class="row"><div class="btn" id="btnConnect">Se connecter</div></div>
+    <div class="hint">
+      Connexion via WebSocket securise (wss://host:8884/mqtt) - le port 8884
+      est fixe cote navigateur, meme si le tracker utilise 8883 de son cote
+      (un navigateur ne peut pas ouvrir de connexion TLS brute, uniquement
+      du WebSocket). Ces identifiants sont ceux deja saisis sur le tracker
+      (portail telephone ou Admin > Sans-fil) - rien n'est enregistre dans
+      ce navigateur, a ressaisir a chaque ouverture si tu n'utilises pas le
+      lien/QR complet genere par le tracker.
+    </div>
+  </div>
+
+  <div id="dash">
+
+    <div class="card">
+      <div class="row" style="align-items:center;">
+        <img id="curIcon" class="weathericon" style="display:none;">
+        <div style="flex:1;">
+          <div class="status-line"><span class="k">Mode</span><span id="vMode" class="badge off">--</span></div>
+          <div class="status-line"><span class="k">Securite</span><span id="vSafety" class="badge off">--</span></div>
+          <div class="status-line"><span class="k">Nuit</span><span id="vNight" class="badge off">--</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Capteurs</h2>
+      <div class="grid4">
+        <div class="tile"><div class="lbl">LDR Est</div><div class="val" id="vLdrE">--</div></div>
+        <div class="tile"><div class="lbl">LDR Ouest</div><div class="val" id="vLdrO">--</div></div>
+        <div class="tile"><div class="lbl">LDR Haut</div><div class="val" id="vLdrH">--</div></div>
+        <div class="tile"><div class="lbl">LDR Bas</div><div class="val" id="vLdrB">--</div></div>
+      </div>
+      <div class="grid4" style="margin-top:8px;">
+        <div class="tile">
+          <div class="lbl">Vent</div><div class="val" id="vWind">--</div>
+          <div class="bar"><span id="barWind" style="width:0%"></span></div>
+        </div>
+        <div class="tile"><div class="lbl">Batterie</div><div class="val" id="vBatt">--</div></div>
+        <div class="tile"><div class="lbl">Azimut</div><div class="val" id="vAz">--</div></div>
+        <div class="tile"><div class="lbl">Tilt</div><div class="val" id="vTilt">--</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Prevision (06h - 18h)</h2>
+      <div class="forecast" id="forecastRow"></div>
+    </div>
+
+    <div class="card">
+      <h2>Mode de suivi</h2>
+      <div class="row">
+        <div class="btn" id="btnAuto">AUTO</div>
+        <div class="btn" id="btnManu">MANU</div>
+        <div class="btn" id="btnAxis">Axe : --</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Protection vent (repli automatique)</h2>
+      <div class="row">
+        <div class="btn" id="btnRepli">Repli auto : --</div>
+      </div>
+      <div class="hint">Nécessite une session Admin active sur l'écran local du tracker - sinon la commande est ignorée en silence (sécurité voulue, cf. firmware). A désactiver seulement en connaissance de cause : coupe la mise à l'abri automatique en cas de rafale.</div>
+    </div>
+
+    <div class="card">
+      <h2>Commande manuelle (mode Manu uniquement)</h2>
+      <div class="jogpad">
+        <div></div><div class="btn" data-jog="up">&#9650;</div><div></div>
+        <div class="btn" data-jog="west">&#9664;</div>
+        <div class="btn crit" id="btnEstop">STOP</div>
+        <div class="btn" data-jog="east">&#9654;</div>
+        <div></div><div class="btn" data-jog="down">&#9660;</div><div></div>
+      </div>
+      <div class="hint">Maintenir appuye pour deplacer (comme sur l'ecran du tracker) - relachement ou perte de connexion = arret automatique sous 2s.</div>
+    </div>
+
+    <div class="card">
+      <h2>Calibrage zero (armer puis confirmer)</h2>
+      <div class="row">
+        <div class="btn" id="btnRazAz">RAZ Azimut</div>
+        <div class="btn" id="btnRazTilt">RAZ Tilt</div>
+        <div class="btn" id="btnNuit">Seuil nuit (LDR E/O)</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Decalage LDR (offset)</h2>
+      <div class="grid4">
+        <div><div class="lbl" style="text-align:center;margin-bottom:4px;">Est</div><div class="row"><div class="btn" data-ldr="E" data-delta="-10">-</div><div class="btn" data-ldr="E" data-delta="10">+</div></div></div>
+        <div><div class="lbl" style="text-align:center;margin-bottom:4px;">Ouest</div><div class="row"><div class="btn" data-ldr="O" data-delta="-10">-</div><div class="btn" data-ldr="O" data-delta="10">+</div></div></div>
+        <div><div class="lbl" style="text-align:center;margin-bottom:4px;">Haut</div><div class="row"><div class="btn" data-ldr="H" data-delta="-10">-</div><div class="btn" data-ldr="H" data-delta="10">+</div></div></div>
+        <div><div class="lbl" style="text-align:center;margin-bottom:4px;">Bas</div><div class="row"><div class="btn" data-ldr="B" data-delta="-10">-</div><div class="btn" data-ldr="B" data-delta="10">+</div></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Etat</h2>
+      <div class="status-line"><span class="k">Mode dégradé (suivi secours)</span><span id="vFallback">--</span></div>
+      <div class="status-line"><span class="k">Arret d'urgence</span><span id="vEstop">--</span></div>
+      <div class="status-line"><span class="k">Derniere donnee recue</span><span id="vLastSeen">--</span></div>
+      <div class="hint">Le deverrouillage de l'arret d'urgence n'est volontairement pas disponible depuis ce tableau de bord - uniquement en local, Admin &gt; Moteur sur le tracker.</div>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---- Parametres de connexion (URL ?host=&user=&pass=&topic= pre-remplit
+  // le formulaire si ouvert depuis le lien/QR genere par le tracker en fin
+  // de portail telephone - sinon saisie manuelle a chaque ouverture). ----
+  // CORRECTIF (mise a jour dashboard) : plus de localStorage - stockage de
+  // mots de passe dans le navigateur retire (aucune persistance disque
+  // requise ici pour anything I produce as an artifact, cf. consignes
+  // "jamais de localStorage/sessionStorage"). Reste en memoire JS pour la
+  // duree de la page uniquement ; le lien/QR du tracker reste le moyen
+  // normal de pre-remplir a chaque visite.
+  var qs = new URLSearchParams(window.location.search);
+  var initial = {
+    host:  qs.get("host")  || "",
+    user:  qs.get("user")  || "",
+    pass:  qs.get("pass")  || "",
+    topic: qs.get("topic") || "tracker/status"
+  };
+  document.getElementById("fHost").value  = initial.host;
+  document.getElementById("fUser").value  = initial.user;
+  document.getElementById("fPass").value  = initial.pass;
+  document.getElementById("fTopic").value = initial.topic;
+
+  var client = null;
+  var cfg = null;
+  var lastSeenMs = 0;
+
+  function cmdTopic(){ return cfg.topic + "/cmd"; }
+
+  function setConnState(state){
+    // state: "off" | "connecting" | "ok"
+    var dot = document.getElementById("connDot");
+    var lbl = document.getElementById("connLabel");
+    dot.className = (state === "ok") ? "ok" : (state === "connecting" ? "warn" : "");
+    lbl.textContent = (state === "ok") ? "Connecte" : (state === "connecting" ? "Connexion..." : "Non connecte");
+  }
+
+  function connect(){
+    cfg = {
+      host:  document.getElementById("fHost").value.trim(),
+      user:  document.getElementById("fUser").value.trim(),
+      pass:  document.getElementById("fPass").value,
+      topic: document.getElementById("fTopic").value.trim() || "tracker/status"
+    };
+    if (!cfg.host || !cfg.topic) { alert("Host et Topic sont obligatoires."); return; }
+
+    setConnState("connecting");
+    var url = "wss://" + cfg.host + ":8884/mqtt";
+    client = mqtt.connect(url, {
+      username: cfg.user,
+      password: cfg.pass,
+      clientId: "dashboard_" + Math.random().toString(16).slice(2),
+      reconnectPeriod: 3000,
+      connectTimeout: 8000
+    });
+
+    client.on("connect", function(){
+      setConnState("ok");
+      document.getElementById("loginCard").style.display = "none";
+      document.getElementById("dash").style.display = "block";
+      client.subscribe(cfg.topic);
+    });
+    client.on("reconnect", function(){ setConnState("connecting"); });
+    client.on("close",     function(){ setConnState("off"); });
+    client.on("error",     function(e){ setConnState("off"); console.error("MQTT error", e); });
+
+    client.on("message", function(topic, payloadBuf){
+      if (topic !== cfg.topic) return;
+      var data;
+      try { data = JSON.parse(payloadBuf.toString()); } catch(e){ return; }
+      lastSeenMs = Date.now();
+      renderStatus(data);
+    });
+  }
+
+  function publishCmd(obj){
+    if (!client || !client.connected) return;
+    client.publish(cmdTopic(), JSON.stringify(obj));
+  }
+
+  // ---- Rendu de l'etat recu (meme structure que PublishMqttStatus() cote
+  // firmware - cf. commentaire du .ino) ----
+  function ldrLevelColor(v){
+    if (v < 5000) return "var(--crit)";
+    if (v < 15000) return "var(--warn)";
+    return "var(--good)";
+  }
+  function renderStatus(d){
+    document.getElementById("vLdrE").textContent = d.ldrE;
+    document.getElementById("vLdrO").textContent = d.ldrO;
+    document.getElementById("vLdrH").textContent = d.ldrH;
+    document.getElementById("vLdrB").textContent = d.ldrB;
+
+    document.getElementById("vWind").textContent = d.wind.toFixed(1) + " km/h";
+    var windPct = d.windMax > 0 ? Math.min(100, (d.wind / d.windMax) * 100) : 0;
+    var windBar = document.getElementById("barWind");
+    windBar.style.width = windPct + "%";
+    windBar.style.background = windPct >= 100 ? "var(--crit)" : (windPct >= 70 ? "var(--warn)" : "var(--good)");
+
+    document.getElementById("vBatt").textContent = d.batt.toFixed(2) + " V";
+    document.getElementById("vAz").textContent   = d.az + "°" + (d.azMove ? " ↻" : "");
+    document.getElementById("vTilt").textContent = d.tilt + "°" + (d.tiltMove ? " ↻" : "");
+
+    var vMode = document.getElementById("vMode");
+    vMode.textContent = d.mode;
+    vMode.className = "badge " + (d.mode === "AUTO" ? "ok" : "off");
+
+    var vSafety = document.getElementById("vSafety");
+    vSafety.textContent = d.safety;
+    vSafety.className = "badge " + (d.safety === "OK" ? "ok" : "crit");
+
+    var vNight = document.getElementById("vNight");
+    vNight.textContent = d.night ? "Oui" : "Non";
+    vNight.className = "badge " + (d.night ? "off" : "ok");
+
+    document.getElementById("vFallback").textContent = d.fallback ? "Actif" : "Inactif";
+    document.getElementById("vEstop").textContent = d.estop ? "VERROUILLE" : "Libre";
+    document.getElementById("vEstop").style.color = d.estop ? "var(--crit)" : "var(--good)";
+
+    document.getElementById("btnAuto").className = "btn" + (d.mode === "AUTO" ? " on" : "");
+    document.getElementById("btnManu").className = "btn" + (d.mode === "MANUEL" ? " on" : "");
+    document.getElementById("btnAxis").textContent = "Axe : " + (d.axis === "double" ? "2 axes" : "1 axe");
+
+    // AJOUT (mise a jour dashboard, cf. LOT181 .ino - cmd:"repli") : etat du
+    // vrai repli vent (RepliEnabled), a ne pas confondre avec d.fallback
+    // (mode degrade/suivi secours, notion differente juste au-dessus).
+    if (d.repli != null) {
+      var btnRepli = document.getElementById("btnRepli");
+      btnRepli.textContent = "Repli auto : " + (d.repli ? "Activé" : "Désactivé");
+      btnRepli.className = "btn" + (d.repli ? " on" : "");
+    }
+
+    // Icones prevision (codes standards OpenWeatherMap - servies directement
+    // depuis openweathermap.org, le navigateur a internet contrairement au
+    // tracker pendant le portail de configuration).
+    var row = document.getElementById("forecastRow");
+    row.innerHTML = "";
+    (d.fc || []).forEach(function(code){
+      if (!code) return;
+      var img = document.createElement("img");
+      img.src = "https://openweathermap.org/img/wn/" + code + ".png";
+      row.appendChild(img);
+    });
+    if (d.fc && d.fc[3]) {
+      var cur = document.getElementById("curIcon");
+      cur.src = "https://openweathermap.org/img/wn/" + d.fc[3] + "@2x.png";
+      cur.style.display = "inline-block";
+    }
+  }
+
+  setInterval(function(){
+    var el = document.getElementById("vLastSeen");
+    if (!lastSeenMs) { el.textContent = "--"; return; }
+    var s = Math.round((Date.now() - lastSeenMs) / 1000);
+    el.textContent = s + " s";
+    el.style.color = s > 15 ? "var(--crit)" : "var(--text-muted)";
+  }, 1000);
+
+  // ---- Commandes ----
+  document.getElementById("btnConnect").addEventListener("click", connect);
+  document.getElementById("btnAuto").addEventListener("click", function(){ publishCmd({cmd:"auto"}); });
+  document.getElementById("btnManu").addEventListener("click", function(){ publishCmd({cmd:"manu"}); });
+  document.getElementById("btnAxis").addEventListener("click", function(){ publishCmd({cmd:"axis"}); });
+  document.getElementById("btnRepli").addEventListener("click", function(){ publishCmd({cmd:"repli"}); });
+  document.getElementById("btnEstop").addEventListener("click", function(){
+    if (confirm("Declencher l'arret d'urgence du tracker ?")) publishCmd({cmd:"estop"});
+  });
+
+  // RAZ AZ/TILT/NUIT : cycle armer/confirmer - meme discipline "2 clics"
+  // que l'ecran Mode Run, refletee visuellement ici (surbrillance +
+  // desarmement local apres 10s si pas de 2e clic).
+  function makeArmConfirmButton(id, cmd, label){
+    var btn = document.getElementById(id);
+    var armed = false, timer = null;
+    btn.addEventListener("click", function(){
+      publishCmd({cmd:cmd});
+      armed = !armed;
+      btn.classList.toggle("armed", armed);
+      btn.textContent = armed ? (label + " - confirmer ?") : label;
+      if (timer) clearTimeout(timer);
+      if (armed) {
+        timer = setTimeout(function(){ armed = false; btn.classList.remove("armed"); btn.textContent = label; }, 10000);
+      }
+    });
+  }
+  makeArmConfirmButton("btnRazAz",   "raz_az",   "RAZ Azimut");
+  makeArmConfirmButton("btnRazTilt", "raz_tilt", "RAZ Tilt");
+  makeArmConfirmButton("btnNuit",    "nuit",     "Seuil nuit (LDR E/O)");
+
+  // Jog directionnel : maintenir = "start" + ping toutes les 700ms
+  // (< REMOTE_JOG_WATCHDOG_MS=2000ms cote firmware), relacher = "stop".
+  var jogTimers = {};
+  document.querySelectorAll("[data-jog]").forEach(function(btn){
+    var dir = btn.getAttribute("data-jog");
+    function start(){
+      publishCmd({cmd:"jog", dir:dir, state:"start"});
+      if (jogTimers[dir]) clearInterval(jogTimers[dir]);
+      jogTimers[dir] = setInterval(function(){ publishCmd({cmd:"jog", dir:dir, state:"start"}); }, 700);
+      btn.classList.add("on");
+    }
+    function stop(){
+      if (jogTimers[dir]) { clearInterval(jogTimers[dir]); jogTimers[dir] = null; }
+      publishCmd({cmd:"jog", dir:dir, state:"stop"});
+      btn.classList.remove("on");
+    }
+    btn.addEventListener("mousedown",  start);
+    btn.addEventListener("touchstart", function(e){ e.preventDefault(); start(); }, {passive:false});
+    btn.addEventListener("mouseup",    stop);
+    btn.addEventListener("mouseleave", stop);
+    btn.addEventListener("touchend",   function(e){ e.preventDefault(); stop(); }, {passive:false});
+    btn.addEventListener("touchcancel",stop);
+  });
+
+  document.querySelectorAll("[data-ldr]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      publishCmd({cmd:"ldr_offset", which:btn.getAttribute("data-ldr"), delta:parseInt(btn.getAttribute("data-delta"),10)});
+    });
+  });
+
+  // Connexion automatique si la page est ouverte via le lien/QR complet du
+  // tracker (host present dans l'URL) - sinon, saisie manuelle + clic requis.
+  if (initial.host && initial.topic && qs.get("host")) {
+    connect();
+  }
+})();
+</script>
+</body>
+</html>
