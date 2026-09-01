@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tracker Solaire - Manuel</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  /*
+    FICHIER DERIVE (session, GO : "on fait la meme dans le 2eme html mais
+    pour le rendu du mode manuel") - copie de tracker_dashboard.html, dont
+    seule la zone centrale "Auto" (logo tracker, icones prevision,
+    fleches azimut/tilt clignotantes - DrawTrackerLogoFromSD/
+    DrawTrackerForecastIcons/DrawTrackerArrowOverlays du .ino) a ete
+    retiree : ce fichier n'affiche QUE la zone centrale "Manu"
+    (DrawManualJogControls/DrawAs5600Gauges), en permanence (plus de
+    bascule display:none pilotee par un onglet). Bandeau superieur (LDR/
+    vent), colonnes gauche/droite (AUTO/MANU/AXE/RAZ/SECU/NUIT/...),
+    connexion MQTT, cartes Prevision/Etat : IDENTIQUES au fichier source,
+    memes coordonnees .ino, memes commandes (flechesjog = start/stop
+    moteur au clic/maintien, STOP arme/confirme, RAZ AZ/TILT/NUIT
+    arme/confirme). Toute correction faite ici doit etre reportee dans
+    tracker_dashboard.html si elle concerne une partie commune aux 2
+    fichiers (les 2 ne sont PAS generes automatiquement l'un depuis
+    l'autre - divergence possible si edite un seul cote).
+  */
+  :root{
+    --bg:#0b0f14; --surface:#141b23; --surface2:#1b2530; --border:#26323f;
+    --text:#e8edf2; --text-muted:#8a97a6; --accent:#3b82f6;
+    --good:#22c55e; --warn:#f59e0b; --crit:#ef4444; --off:#3a4553;
+
+    /* Palette ecran Mode Run (cf. commentaire ci-dessus) */
+    --tft-bg:#000000;
+    --tft-select:#ff0000;        /* THEME_SELECT (defaut) */
+    --tft-selecttext:#ffffff;    /* THEME_SELECTTEXT (defaut) */
+    --tft-highlight:#ffbe73;     /* THEME_HIGHLIGHT (defaut, orange clair) */
+    --tft-fg:#ffffff;            /* THEME_FG_TFT */
+    --tft-green:#00ff00; --tft-red:#ff0000; --tft-yellow:#ffff00;
+    --tft-orange:#ffa500; --tft-darkgrey:#7b7d7b; --tft-maroon:#7b0000;
+    --tft-tabbg:#bedcff;         /* color565(190,220,255) */
+    --tft-logobg:#d2e1f5;        /* color565(210,225,245) */
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg);z-index:5;}
+  header h1{font-size:16px;margin:0;font-weight:600;}
+  #connDot{width:10px;height:10px;border-radius:50%;background:var(--crit);display:inline-block;margin-right:6px;}
+  #connDot.ok{background:var(--good);}
+  #connDot.warn{background:var(--warn);}
+  #connLabel{font-size:12px;color:var(--text-muted);}
+  main{max-width:960px;margin:0 auto;padding:14px 12px 40px;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin:0 0 10px;font-weight:600;}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+  .tile{background:var(--surface2);border-radius:10px;padding:10px 8px;text-align:center;}
+  .tile .lbl{font-size:11px;color:var(--text-muted);margin-bottom:4px;}
+  .tile .val{font-size:18px;font-weight:700;}
+  .row{display:flex;gap:8px;flex-wrap:wrap;}
+  .btn{flex:1;min-width:90px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:12px 8px;font-size:13px;font-weight:600;text-align:center;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:manipulation;}
+  .btn:active{background:var(--accent);border-color:var(--accent);}
+  .btn.on{background:var(--accent);border-color:var(--accent);}
+  .btn.armed{background:var(--warn);border-color:var(--warn);color:#1a1200;}
+  .hint{font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.4;}
+  input[type=text],input[type=password],input[type=number]{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;font-size:14px;margin-bottom:8px;}
+  label{font-size:12px;color:var(--text-muted);display:block;margin-bottom:3px;}
+  #loginCard .btn{background:var(--accent);border-color:var(--accent);}
+  #dash{display:none;}
+
+  /* ---- Ecran Mode Run (SVG, viewBox 0 0 480 320) ---- */
+  #screenWrap{width:100%;max-width:960px;aspect-ratio:3/2;margin:0 auto 12px;border-radius:14px;overflow:hidden;border:1px solid var(--border);background:var(--tft-bg);}
+  #screenSvg{width:100%;height:100%;display:block;touch-action:manipulation;}
+  .svgTxt{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;fill:var(--tft-fg);user-select:none;}
+  .colBtn, .tabBtn, .jogBtn{cursor:pointer;}
+  .colBtn rect, .jogBtn rect{transition:fill .1s;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Tracker Solaire - Manuel</h1>
+  <div><span id="connDot"></span><span id="connLabel">Non connecte</span></div>
+</header>
+
+<main>
+
+  <!-- Formulaire de connexion MQTT (identifiants du broker configure sur le tracker, Sans-fil > Menu MQTT) -->
+  <div class="card" id="loginCard">
+    <h2>Connexion MQTT (une seule fois)</h2>
+    <label for="fHost">TLS websocket url (ex: xxxx.s1.eu.hivemq.cloud)</label>
+    <input type="text" id="fHost" placeholder="xxxx.s1.eu.hivemq.cloud">
+    <label for="fUser">Utilisateur</label>
+    <input type="text" id="fUser">
+    <label for="fPass">Mot de passe</label>
+    <input type="password" id="fPass">
+    <label for="fTopic">Topic (identique a celui du tracker)</label>
+    <input type="text" id="fTopic" placeholder="tracker/status">
+    <div class="row"><div class="btn" id="btnConnect">Se connecter</div></div>
+    <div class="hint">
+      Connexion via WebSocket securise (wss://host:8884/mqtt) - le port 8884
+      est fixe cote navigateur, meme si le tracker utilise 8883 de son cote.
+      Ces identifiants sont ceux deja saisis sur le tracker (portail
+      telephone ou Sans-fil > Menu MQTT) - rien n'est enregistre dans ce
+      navigateur, a ressaisir a chaque ouverture si tu n'utilises pas le
+      lien/QR complet genere par le tracker.
+    </div>
+  </div>
+
+  <div id="dash">
+
+    <!-- Replique ecran Mode Run (Auto/Manu) - coordonnees .ino, cf. commentaire CSS -->
+    <div id="screenWrap">
+      <svg id="screenSvg" viewBox="0 0 480 320" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="0" width="480" height="320" fill="var(--tft-bg)"/>
+
+        <!-- Bandeau superieur : 5 onglets LDR E/O/H/B + Vent (DrawModeRunTopTabs, x=40+i*80, w=78, h=40) -->
+        <g id="topTabs" font-size="7">
+          <!-- genere en JS (buildTopTabs()) -->
+        </g>
+
+        <!-- Colonne gauche : AUTO/MANU/AXE/RAZ AZ/RAZ TILT (DrawModeRunLeftColumn, x=0, w=40, y=42+40*i, h=39) -->
+        <g id="leftCol"></g>
+
+        <!-- Colonne droite : SECU/REC/NUIT/LEVER/EXIT (DrawModeRunRightColumn, x=440, w=40) -->
+        <g id="rightCol"></g>
+
+        <!-- Zone centrale : bascule Auto <-> Manu (DrawModeRunUnified, x=50 y=40 w=380 h=233) -->
+
+        <g id="centralManu">
+          <!-- Pave directionnel + STOP (DrawManualJogControls) -->
+          <g id="jogPad">
+            <rect id="jogUp" class="jogBtn" data-jog="up" x="170" y="67" width="140" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="240,76 230,96 250,96" fill="var(--tft-orange)"/>
+            <rect id="jogDown" class="jogBtn" data-jog="down" x="170" y="231" width="140" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="240,260 230,240 250,240" fill="var(--tft-orange)"/>
+            <rect id="jogWest" class="jogBtn" data-jog="west" x="65" y="149" width="80" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="72,168 92,158 92,178" fill="var(--tft-orange)"/>
+            <rect id="jogEast" class="jogBtn" data-jog="east" x="335" y="149" width="80" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="408,168 388,158 388,178" fill="var(--tft-orange)"/>
+            <rect id="btnEstopSvg" x="180" y="149" width="120" height="38" rx="4" fill="var(--tft-red)" stroke="#fff" style="cursor:pointer"/>
+            <text id="estopTxt1" x="240" y="164" text-anchor="middle" class="svgTxt" font-size="9" font-weight="700">ARRET</text>
+            <text id="estopTxt2" x="240" y="177" text-anchor="middle" class="svgTxt" font-size="9" font-weight="700">D'URGENCE</text>
+          </g>
+          <!-- Jauges AS5600 Azimut (cx=105) / Tilt (cx=375), cy=96, r=40 -->
+          <g id="gaugeAz"></g>
+          <g id="gaugeTilt"></g>
+        </g>
+      </svg>
+    </div>
+    <div class="hint" style="margin:-6px 0 12px;">Ecran interactif : tape AUTO/MANU/AXE/RAZ/SECU/NUIT/LEVER/EXIT dans les colonnes, ou les fleches/STOP en mode Manu - memes commandes que l'ecran local.</div>
+
+    <div class="card">
+      <h2>Prevision (detail)</h2>
+      <div class="hint">Seuil nuit actuel : <span id="vNightThreshold">--</span> &nbsp;|&nbsp; Offsets LDR E/O/H/B : <span id="vOffE">--</span>/<span id="vOffO">--</span>/<span id="vOffH">--</span>/<span id="vOffB">--</span></div>
+      <div class="row" style="margin-top:8px;">
+        <div class="btn" data-ldr="E" data-delta="-10">LDR E -10</div><div class="btn" data-ldr="E" data-delta="10">LDR E +10</div>
+        <div class="btn" data-ldr="O" data-delta="-10">LDR O -10</div><div class="btn" data-ldr="O" data-delta="10">LDR O +10</div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div class="btn" data-ldr="H" data-delta="-10">LDR H -10</div><div class="btn" data-ldr="H" data-delta="10">LDR H +10</div>
+        <div class="btn" data-ldr="B" data-delta="-10">LDR B -10</div><div class="btn" data-ldr="B" data-delta="10">LDR B +10</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Etat</h2>
+      <div class="hint" id="vLastSeenLine">Derniere donnee recue : <span id="vLastSeen">--</span></div>
+      <div class="hint">Le deverrouillage de l'arret d'urgence n'est volontairement pas disponible depuis ce tableau de bord - uniquement en local, Admin &gt; Moteur sur le tracker.</div>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---- Connexion (inchange) ----
+  var qs = new URLSearchParams(window.location.search);
+  var initial = {
+    host:  qs.get("host")  || "",
+    user:  qs.get("user")  || "",
+    pass:  qs.get("pass")  || "",
+    topic: qs.get("topic") || "tracker/status"
+  };
+  document.getElementById("fHost").value  = initial.host;
+  document.getElementById("fUser").value  = initial.user;
+  document.getElementById("fPass").value  = initial.pass;
+  document.getElementById("fTopic").value = initial.topic;
+
+  var client = null;
+  var cfg = null;
+  var lastSeenMs = 0;
+  var lastStatus = null;   // dernier message frequent recu (az/ti/md/...)
+  var wsDisplayedTab = "AUTO"; // onglet actuellement affiche cote dashboard (AUTO|MANU), meme role que WsDisplayedTab cote .ino
+
+  function cmdTopic(){ return cfg.topic + "/cmd"; }
+
+  // AJOUT (session, GO : "il faut un retour au mode auto, on doit pas
+  // rester bloque sur la page manu") - construit l'URL de l'autre page
+  // (tracker_dashboard.html) avec les memes identifiants MQTT deja
+  // saisis ici, pour ne pas avoir a les resaisir en y arrivant (meme
+  // mecanique que celle deja prevue par ce fichier pour se pre-remplir
+  // depuis l'URL, cf. plus bas "var qs = new URLSearchParams(...)").
+  function crossPageUrl(page){
+    if (!cfg) return null;
+    var p = new URLSearchParams();
+    p.set("host", cfg.host);
+    if (cfg.user) p.set("user", cfg.user);
+    if (cfg.pass) p.set("pass", cfg.pass);
+    p.set("topic", cfg.topic);
+    return page + "?" + p.toString();
+  }
+
+  function setConnState(state){
+    var dot = document.getElementById("connDot");
+    var lbl = document.getElementById("connLabel");
+    dot.className = (state === "ok") ? "ok" : (state === "connecting" ? "warn" : "");
+    lbl.textContent = (state === "ok") ? "Connecte" : (state === "connecting" ? "Connexion..." : "Non connecte");
+  }
+
+  function connect(){
+    cfg = {
+      host:  document.getElementById("fHost").value.trim(),
+      user:  document.getElementById("fUser").value.trim(),
+      pass:  document.getElementById("fPass").value,
+      topic: document.getElementById("fTopic").value.trim() || "tracker/status"
+    };
+    if (!cfg.host || !cfg.topic) { alert("Host et Topic sont obligatoires."); return; }
+
+    setConnState("connecting");
+    var url = "wss://" + cfg.host + ":8884/mqtt";
+    client = mqtt.connect(url, {
+      username: cfg.user,
+      password: cfg.pass,
+      clientId: "dashboard_" + Math.random().toString(16).slice(2),
+      reconnectPeriod: 3000,
+      connectTimeout: 8000
+    });
+
+    client.on("connect", function(){
+      setConnState("ok");
+      document.getElementById("loginCard").style.display = "none";
+      document.getElementById("dash").style.display = "block";
+      client.subscribe(cfg.topic);
+    });
+    client.on("reconnect", function(){ setConnState("connecting"); });
+    client.on("close",     function(){ setConnState("off"); });
+    client.on("error",     function(e){ setConnState("off"); console.error("MQTT error", e); });
+
+    client.on("message", function(topic, payloadBuf){
+      if (topic !== cfg.topic) return;
+      var data;
+      try { data = JSON.parse(payloadBuf.toString()); } catch(e){ return; }
+      if (data.t === "ex") { renderExtra(data); return; }
+      lastSeenMs = Date.now();
+      lastStatus = data;
+      renderStatus(data);
+    });
+  }
+
+  function publishCmd(obj){
+    if (!client || !client.connected) return;
+    client.publish(cmdTopic(), JSON.stringify(obj));
+  }
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function svgEl(tag, attrs){
+    var el = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+
+  // ---- Bandeau superieur : 5 onglets (DrawModeRunTopTabs) ----
+  var TOP_TABS = [
+    {key:"lE", label:"LDR E", unit:""},
+    {key:"lO", label:"LDR O", unit:""},
+    {key:"lH", label:"LDR H", unit:""},
+    {key:"lB", label:"LDR B", unit:""},
+    {key:"wd", label:"Vent",  unit:" km/h"}
+  ];
+  function buildTopTabs(){
+    var g = document.getElementById("topTabs");
+    TOP_TABS.forEach(function(t, i){
+      var x = 40 + i*80, y = 0, w = 78, h = 40;
+      g.appendChild(svgEl("rect", {x:x, y:y, width:w, height:h, rx:4, fill:"var(--tft-tabbg)", id:"tab_" + t.key}));
+      var lbl = svgEl("text", {x:x+4, y:y+9, class:"svgTxt", "font-size":6, fill:"#1a2a3a"});
+      lbl.textContent = t.label;
+      g.appendChild(lbl);
+      var val = svgEl("text", {x:x+4, y:y+22, class:"svgTxt", "font-size":9, "font-weight":700, fill:"#1a2a3a", id:"tabval_" + t.key});
+      val.textContent = "--";
+      g.appendChild(val);
+      g.appendChild(svgEl("rect", {x:x+6, y:y+34, width:68, height:6, rx:2, fill:"none", stroke:"var(--tft-darkgrey)", "stroke-width":0.5}));
+      g.appendChild(svgEl("rect", {x:x+6, y:y+34, width:0, height:6, rx:2, fill:"var(--tft-green)", id:"tabbar_" + t.key}));
+    });
+  }
+
+  // ---- Colonnes gauche/droite (DrawModeRunLeftColumn/DrawModeRunRightColumn) ----
+  var LEFT_ITEMS  = [
+    {key:"auto", label:"AUTO", cmd:{cmd:"auto"}},
+    {key:"manu", label:"MANU", cmd:{cmd:"manu"}},
+    {key:"axe",  label:"AXE",  cmd:{cmd:"axis"}},
+    {key:"razaz",label:"RAZ AZ", cmd:{cmd:"raz_az"}},
+    {key:"raztilt",label:"RAZ TILT", cmd:{cmd:"raz_tilt"}}
+  ];
+  var RIGHT_ITEMS = [
+    {key:"secu",  label:"SECU",  cmd:{cmd:"repli"}},
+    {key:"rec",   label:"REC",   cmd:null},
+    {key:"nuit",  label:"NUIT",  cmd:{cmd:"nuit"}},
+    {key:"lever", label:"LEVER", cmd:null},
+    {key:"exit",  label:"EXIT",  cmd:null}
+  ];
+  function buildColumn(containerId, items, x){
+    var g = document.getElementById(containerId);
+    items.forEach(function(it, i){
+      var y = 42 + 40*i, w = 40, h = 39;
+      var grp = svgEl("g", {class:"colBtn", id: "col_" + it.key});
+      grp.appendChild(svgEl("rect", {x:x, y:y, width:w, height:h, rx:6, fill:"var(--tft-darkgrey)", id:"colrect_" + it.key}));
+      var txt = svgEl("text", {x:x+w/2, y:y+h/2+3, "text-anchor":"middle", class:"svgTxt", "font-size":6.5, "font-weight":700, id:"coltxt_" + it.key});
+      it.label.split(" ").forEach(function(word, wi){
+        var tspan = document.createElementNS(SVGNS, "tspan");
+        tspan.setAttribute("x", x+w/2);
+        tspan.setAttribute("dy", wi === 0 ? (it.label.indexOf(" ")>0 ? -4 : 0) : 8);
+        tspan.textContent = word;
+        txt.appendChild(tspan);
+      });
+      grp.appendChild(txt);
+      if (it.cmd) grp.addEventListener("click", function(){
+        publishCmd(it.cmd);
+        if (it.key === "manu") setDisplayedTab("MANU");
+        if (it.key === "auto") {
+          // AJOUT (session, GO : "il faut un retour au mode auto, on doit
+          // pas rester bloque sur la page manu") - cette page n'a PAS de
+          // rendu Auto (retire volontairement, cf. commentaire d'entete) :
+          // au lieu de juste changer un onglet cache, on renvoie vers
+          // tracker_dashboard.html (identifiants MQTT deja saisis reportes
+          // dans l'URL). setTimeout court pour laisser partir le publishCmd
+          // ci-dessus AVANT de quitter la page/couper la connexion WS.
+          setDisplayedTab("AUTO");
+          var url = crossPageUrl("tracker_dashboard.html");
+          if (url) setTimeout(function(){ window.location.href = url; }, 200);
+        }
+      });
+      if (it.key === "exit") grp.addEventListener("click", function(){ /* pas de commande distante d'origine - simple retour visuel local */ });
+      g.appendChild(grp);
+    });
+  }
+
+  function setDisplayedTab(tab){
+    wsDisplayedTab = tab;
+    updateColumnHighlight();
+  }
+  function updateColumnHighlight(){
+    document.getElementById("colrect_auto").setAttribute("fill", wsDisplayedTab === "AUTO" ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    document.getElementById("colrect_manu").setAttribute("fill", wsDisplayedTab === "MANU" ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    document.getElementById("coltxt_auto").setAttribute("fill", wsDisplayedTab === "AUTO" ? "var(--tft-selecttext)" : "var(--tft-fg)");
+    document.getElementById("coltxt_manu").setAttribute("fill", wsDisplayedTab === "MANU" ? "var(--tft-selecttext)" : "var(--tft-fg)");
+  }
+
+  // ---- Zone centrale Manu : jauges AS5600 (DrawAs5600Gauges/DrawAs5600Gauge) ----
+  function buildGauge(containerId, cx, cy, r, label){
+    var g = document.getElementById(containerId);
+    g.appendChild(svgEl("circle", {cx:cx, cy:cy, r:r, fill:"var(--tft-bg)"}));
+    var ticksG = svgEl("g", {id: containerId + "_ticks"});
+    for (var i = 0; i < 24; i++){
+      var ang = (i * 15 - 90) * Math.PI / 180; // 0 deg = 12h, sens horaire
+      var x1 = cx + (r-8) * Math.cos(ang), y1 = cy + (r-8) * Math.sin(ang);
+      var x2 = cx + r * Math.cos(ang), y2 = cy + r * Math.sin(ang);
+      ticksG.appendChild(svgEl("line", {x1:x1, y1:y1, x2:x2, y2:y2, stroke:"var(--tft-darkgrey)", "stroke-width":2, id: containerId + "_tick" + i}));
+    }
+    g.appendChild(ticksG);
+    g.appendChild(svgEl("circle", {cx:cx, cy:cy, r:r, fill:"none", stroke:"var(--tft-darkgrey)", "stroke-width":1.5, id: containerId + "_ring"}));
+    var val = svgEl("text", {x:cx, y:cy-6, "text-anchor":"middle", class:"svgTxt", "font-size":13, "font-weight":700, id: containerId + "_val"});
+    val.textContent = "--";
+    g.appendChild(val);
+    var lbl = svgEl("text", {x:cx, y:cy+14, "text-anchor":"middle", class:"svgTxt", "font-size":7, id: containerId + "_lbl"});
+    lbl.textContent = label;
+    g.appendChild(lbl);
+  }
+  function gaugeColor(pct){
+    if (pct < 0.40) return "var(--tft-green)";
+    if (pct < 0.80) return "var(--tft-yellow)";
+    return "var(--tft-red)";
+  }
+  function updateGauge(containerId, valueDeg, maxDeg){
+    var pct = Math.max(0, Math.min(1, valueDeg / maxDeg));
+    var col = gaugeColor(pct);
+    var lit = Math.round(pct * 24);
+    for (var i = 0; i < 24; i++){
+      document.getElementById(containerId + "_tick" + i).setAttribute("stroke", i < lit ? col : "var(--tft-darkgrey)");
+    }
+    document.getElementById(containerId + "_ring").setAttribute("stroke", col);
+    document.getElementById(containerId + "_val").setAttribute("fill", col);
+    document.getElementById(containerId + "_val").textContent = Math.round(valueDeg) + "°";
+    document.getElementById(containerId + "_lbl").setAttribute("fill", col);
+  }
+
+  // ---- Init ----
+  buildTopTabs();
+  buildColumn("leftCol", LEFT_ITEMS, 0);
+  buildColumn("rightCol", RIGHT_ITEMS, 440);
+  buildGauge("gaugeAz",    105, 96, 40, "AZ");
+  buildGauge("gaugeTilt",  375, 96, 40, "TILT");
+  setDisplayedTab("MANU");
+
+  // AJOUT (session, GO code : "meme interface que le ino couleurs position
+  // texte EFFET etc") - clignotement reproduit fidelement (400ms, meme
+  // cadence que CheckArmTimeout()/DrawForecastRecStatus()/etc. cote .ino)
+  // au lieu des couleurs fixes de la version precedente. Un seul ticker
+  // partage (blinkOn) + un etat "arme" par bouton a 2 temps, mêmes noms de
+  // variables Armed que le firmware (RazAzArmed/RazTiltArmed/NuitArmed/
+  // EstopArmed - ici purement visuel cote navigateur, le firmware garde
+  // son propre arme/confirme server-side independant, cf. commentaire
+  // PublishMqttAutoExtra()/ProcessRemoteMqttCommand() dans le .ino).
+  var lastStatus2 = null, lastExtra2 = null;
+  var calibMissing = false;
+  var razAzArmed = false, razTiltArmed = false, nuitArmed = false, estopArmed = false;
+  var blinkOn = false;
+
+  function applyBlinkEffects(){
+    // Calibrage manquant : priorite absolue, toute la colonne gauche clignote rouge
+    if (calibMissing) {
+      var col = blinkOn ? "var(--tft-red)" : "var(--tft-darkgrey)";
+      ["auto","manu","axe","razaz","raztilt"].forEach(function(k){
+        document.getElementById("colrect_" + k).setAttribute("fill", col);
+      });
+    }
+    // RAZ AZ / RAZ TILT / NUIT armes : clignotent highlight/darkgrey
+    if (razAzArmed)   document.getElementById("colrect_razaz").setAttribute("fill", blinkOn ? "var(--tft-highlight)" : "var(--tft-darkgrey)");
+    if (razTiltArmed) document.getElementById("colrect_raztilt").setAttribute("fill", blinkOn ? "var(--tft-highlight)" : "var(--tft-darkgrey)");
+    if (nuitArmed)     document.getElementById("colrect_nuit").setAttribute("fill", blinkOn ? "var(--tft-highlight)" : "var(--tft-darkgrey)");
+    // STOP arme : texte + fond clignotent rouge/blanc (meme principe que EstopArmed/DrawManualJogControls)
+    if (estopArmed) {
+      document.getElementById("btnEstopSvg").setAttribute("fill", blinkOn ? "var(--tft-red)" : "#ffffff");
+      document.getElementById("estopTxt1").setAttribute("fill", blinkOn ? "#ffffff" : "var(--tft-red)");
+      document.getElementById("estopTxt2").setAttribute("fill", blinkOn ? "#ffffff" : "var(--tft-red)");
+    }
+    if (lastStatus2) {
+      var d = lastStatus2;
+      // Onglets LDR : clignotent rouge en mode degrade (fb=FallbackEnabled)
+      ["lE","lO","lH","lB"].forEach(function(k){
+        document.getElementById("tab_" + k).setAttribute("fill", d.fb ? (blinkOn ? "var(--tft-red)" : "var(--tft-tabbg)") : "var(--tft-tabbg)");
+      });
+    }
+  }
+  setInterval(function(){ blinkOn = !blinkOn; applyBlinkEffects(); }, 400);
+
+  // ---- Rendu message frequent (az/ti/md/sf/nt/ax/es/lE/lO/lH/lB/wd/wM/bt/fb/rp/aM/tM) ----
+  function renderStatus(d){
+    lastStatus2 = d;
+    document.getElementById("tabval_lE").textContent = d.lE;
+    document.getElementById("tabval_lO").textContent = d.lO;
+    document.getElementById("tabval_lH").textContent = d.lH;
+    document.getElementById("tabval_lB").textContent = d.lB;
+    document.getElementById("tabval_wd").textContent = d.wd.toFixed(1);
+    ["lE","lO","lH","lB"].forEach(function(k){
+      var v = d[k];
+      var pct = Math.max(0, Math.min(1, v / 32767));
+      var bar = document.getElementById("tabbar_" + k);
+      bar.setAttribute("width", 68 * pct);
+      bar.setAttribute("fill", pct < 0.40 ? "var(--tft-green)" : (pct < 0.80 ? "var(--tft-yellow)" : "var(--tft-red)"));
+    });
+    var windPct = d.wM > 0 ? Math.min(1, d.wd / d.wM) : 0;
+    var windBar = document.getElementById("tabbar_wd");
+    windBar.setAttribute("width", 68 * windPct);
+    windBar.setAttribute("fill", windPct >= 1 ? "var(--tft-red)" : (windPct >= 0.7 ? "var(--tft-yellow)" : "var(--tft-green)"));
+
+    // Colonne gauche : AUTO/MANU fixe "on" selon mode courant (pas de clignotement, cf. .ino) ; AXE affiche 1AX/2AX
+    if (!calibMissing) {
+      document.getElementById("colrect_auto").setAttribute("fill", (d.md === "AUTO") ? "var(--tft-select)" : (wsDisplayedTab === "AUTO" ? "var(--tft-select)" : "var(--tft-darkgrey)"));
+      document.getElementById("colrect_manu").setAttribute("fill", (d.md === "MANUEL") ? "var(--tft-select)" : (wsDisplayedTab === "MANU" ? "var(--tft-select)" : "var(--tft-darkgrey)"));
+    }
+    var axeTxt = document.getElementById("coltxt_axe");
+    axeTxt.textContent = "";
+    var axeSpan = document.createElementNS(SVGNS, "tspan");
+    axeSpan.setAttribute("x", 20); axeSpan.setAttribute("dy", 0);
+    axeSpan.textContent = (d.ax === "double") ? "2AX" : "1AX";
+    axeTxt.appendChild(axeSpan);
+
+    // Colonne droite : SECU (repli), NUIT, indicateurs simples (fond select si actif, pas de clignotement propre ici)
+    document.getElementById("colrect_secu").setAttribute("fill", d.rp ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    if (!nuitArmed) document.getElementById("colrect_nuit").setAttribute("fill", d.nt ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    document.getElementById("colrect_rec").setAttribute("fill", d.fb ? "var(--tft-select)" : "var(--tft-darkgrey)");
+
+    // Jauges AS5600 (onglet Manu)
+    updateGauge("gaugeAz",   d.az, 180);
+    updateGauge("gaugeTilt", d.ti, 90);
+
+    // STOP : verrouille = maroon fixe, libre = rouge normal (sauf pendant armement, gere par applyBlinkEffects)
+    if (!estopArmed) document.getElementById("btnEstopSvg").setAttribute("fill", d.es ? "var(--tft-maroon)" : "var(--tft-red)");
+
+    applyBlinkEffects();
+  }
+
+  // ---- Rendu message peu frequent ("t":"ex" - PublishMqttAutoExtra()) ----
+  function renderExtra(d){
+    lastExtra2 = d;
+
+    // Calibrage manquant = TOUTE la colonne gauche clignote rouge sur le vrai ecran (calibMissingBlink, priorite absolue) - cf. applyBlinkEffects()
+    calibMissing = !(d.aC && d.tC);
+    if (!calibMissing) {
+      ["auto","manu","axe","razaz","raztilt"].forEach(function(k){
+        if (k !== "razaz" || !razAzArmed) if (k !== "raztilt" || !razTiltArmed)
+          document.getElementById("colrect_" + k).setAttribute("fill", "var(--tft-darkgrey)");
+      });
+    }
+
+    document.getElementById("vNightThreshold").textContent = d.nT;
+    document.getElementById("vOffE").textContent = d.oE;
+    document.getElementById("vOffO").textContent = d.oO;
+    document.getElementById("vOffH").textContent = d.oH;
+    document.getElementById("vOffB").textContent = d.oB;
+  }
+
+  setInterval(function(){
+    var el = document.getElementById("vLastSeen");
+    if (!lastSeenMs) { el.textContent = "--"; return; }
+    var s = Math.round((Date.now() - lastSeenMs) / 1000);
+    el.textContent = s + " s";
+    el.style.color = s > 15 ? "var(--crit)" : "var(--text-muted)";
+  }, 1000);
+
+  // ---- Commandes ----
+  document.getElementById("btnConnect").addEventListener("click", connect);
+
+  // STOP : cycle armer/confirmer 2 taps, meme principe que EstopArmed cote
+  // .ino (DrawManualJogControls, texte clignotant) au lieu du popup
+  // confirm() de la version precedente.
+  document.getElementById("btnEstopSvg").addEventListener("click", function(){
+    if (estopArmed) {
+      publishCmd({cmd:"estop"});
+      estopArmed = false;
+      document.getElementById("estopTxt1").textContent = "ARRET";
+      document.getElementById("estopTxt2").textContent = "D'URGENCE";
+      document.getElementById("estopTxt1").setAttribute("fill", "#ffffff");
+      document.getElementById("estopTxt2").setAttribute("fill", "#ffffff");
+      document.getElementById("btnEstopSvg").setAttribute("fill", "var(--tft-red)");
+    } else {
+      estopArmed = true;
+      document.getElementById("estopTxt1").textContent = "CONFIRMER";
+      document.getElementById("estopTxt2").textContent = "L'ARRET ?";
+      setTimeout(function(){
+        if (!estopArmed) return;
+        estopArmed = false;
+        document.getElementById("estopTxt1").textContent = "ARRET";
+        document.getElementById("estopTxt2").textContent = "D'URGENCE";
+        document.getElementById("btnEstopSvg").setAttribute("fill", "var(--tft-red)");
+      }, 10000);
+    }
+  });
+
+  // RAZ AZ/TILT/NUIT : cycle armer/confirmer - meme discipline "2 clics" et
+  // meme clignotement (applyBlinkEffects()) que l'ecran Mode Run local.
+  function makeArmConfirmColumn(key, cmd, armedSetter){
+    var el = document.getElementById("col_" + key);
+    var rect = document.getElementById("colrect_" + key);
+    var armed = false, timer = null;
+    el.addEventListener("click", function(){
+      publishCmd({cmd:cmd});
+      armed = !armed;
+      armedSetter(armed);
+      if (!armed) rect.setAttribute("fill", "var(--tft-darkgrey)");
+      if (timer) clearTimeout(timer);
+      if (armed) timer = setTimeout(function(){ armed = false; armedSetter(false); rect.setAttribute("fill", "var(--tft-darkgrey)"); }, 10000);
+    });
+  }
+  makeArmConfirmColumn("razaz",   "raz_az",   function(v){ razAzArmed = v; });
+  makeArmConfirmColumn("raztilt", "raz_tilt", function(v){ razTiltArmed = v; });
+  makeArmConfirmColumn("nuit",    "nuit",     function(v){ nuitArmed = v; });
+
+  // Jog directionnel : maintenir = "start" + ping toutes les 700ms
+  // (< REMOTE_JOG_WATCHDOG_MS=2000ms cote firmware), relacher = "stop".
+  var jogTimers = {};
+  document.querySelectorAll("[data-jog]").forEach(function(btn){
+    var dir = btn.getAttribute("data-jog");
+    function start(){
+      publishCmd({cmd:"jog", dir:dir, state:"start"});
+      if (jogTimers[dir]) clearInterval(jogTimers[dir]);
+      jogTimers[dir] = setInterval(function(){ publishCmd({cmd:"jog", dir:dir, state:"start"}); }, 700);
+      btn.setAttribute("fill", "var(--tft-highlight)");
+    }
+    function stop(){
+      if (jogTimers[dir]) { clearInterval(jogTimers[dir]); jogTimers[dir] = null; }
+      publishCmd({cmd:"jog", dir:dir, state:"stop"});
+      btn.setAttribute("fill", "var(--tft-bg)");
+    }
+    btn.addEventListener("mousedown",  start);
+    btn.addEventListener("touchstart", function(e){ e.preventDefault(); start(); }, {passive:false});
+    btn.addEventListener("mouseup",    stop);
+    btn.addEventListener("mouseleave", stop);
+    btn.addEventListener("touchend",   function(e){ e.preventDefault(); stop(); }, {passive:false});
+    btn.addEventListener("touchcancel",stop);
+  });
+
+  document.querySelectorAll("[data-ldr]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      publishCmd({cmd:"ldr_offset", which:btn.getAttribute("data-ldr"), delta:parseInt(btn.getAttribute("data-delta"),10)});
+    });
+  });
+
+  if (initial.host && initial.topic && qs.get("host")) {
+    connect();
+  }
+})();
+</script>
+</body>
+</html>
