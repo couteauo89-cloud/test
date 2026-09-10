@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tracker Solaire - Tableau de bord Flotte</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  /*
+    LOT F (session, GO "enchaine" - dashboard flotte Backtracking) - page
+    SELECTEUR/VUE D'ENSEMBLE, independante du firmware, cote de
+    tracker_dashboard.html/tracker_dashboard_manuel.html (meme dossier).
+
+    CONNEXION : reprend EXACTEMENT les memes parametres/URL params (host/
+    user/pass/topic) et la meme URL WSS ("wss://"+host+":8884/mqtt") que
+    tracker_dashboard_13.html (verifie par lecture directe du fichier
+    fourni, rien invente) - "topic" ici designe le topic DE BASE du Master
+    (celui configure dans Admin > Backtracking/MQTT sur le Master), PAS un
+    topic par tracker : chaque ligne de la flotte est automatiquement
+    calculee en topic+"/slave_"+posX+"_"+posY, EXACTEMENT le schema mis en
+    place cote firmware (LOT D, fichier08/Core1PublishBacktrackDashFleet())
+    - aucune saisie manuelle de topic par tracker ici non plus, coherent
+    avec "impossible de parametrer 1000 tracker" (session).
+
+    LISTE DES TRACKERS : lue depuis un fichier CSV ou XLS/XLSX "depose a
+    cote" de cette page (session : "la liste des tracker doit etre un xls
+    ou csv qu'on vient deposer dans le repertoire contenant le dashboard").
+    2 chemins, AUCUN suppose fonctionner a coup sur sans le verifier toi-
+    meme (session, STRICT "verifier plutot que deviner" - je n'ai aucun
+    moyen de savoir comment tu heberges reellement ces fichiers depuis
+    cette session) :
+      1) AUTOMATIQUE - fetch() de "trackers.csv" (nom fixe, cf. CSV_FILENAME
+         plus bas) dans le MEME dossier que cette page. Ne fonctionne QUE si
+         les fichiers sont servis par un serveur web (http:// ou https://,
+         meme un simple serveur local) - un fetch() d'un fichier local est
+         bloque par la plupart des navigateurs en ouverture directe
+         (file://).
+      2) MANUEL (repli, TOUJOURS disponible quel que soit l'hebergement) -
+         bouton "Charger un fichier" (selecteur natif du navigateur),
+         accepte aussi bien .csv que .xlsx/.xls (SheetJS, cf. script CDN
+         ci-dessus - MEME source unpkg deja utilisee pour mqtt.js dans
+         tracker_dashboard_13.html, aucune nouvelle politique de dependance
+         introduite).
+
+    FORMAT CSV/XLS ATTENDU (1 ligne d'en-tete obligatoire, ordre des
+    colonnes libre, casse ignoree) :
+        posX,posY,nom
+        0,0,Rangee 1 - Tracker 1
+        1,0,Rangee 1 - Tracker 2
+        0,1,Rangee 2 - Tracker 1
+    "nom" est optionnel (a defaut : "Tracker (posX,posY)"). posX/posY DOIVENT
+    correspondre exactement aux BacktrackPosX/BacktrackPosY configures sur
+    chaque tracker (LOT B, memes positions deja utilisees par le polling
+    ESP-NOW cote firmware) - c'est la SEULE cle de correspondance, aucun
+    autre identifiant n'existe cote firmware.
+
+    ACTIONS PAR LIGNE (session, demande initiale : "prendre la main pour
+    passer en manuel, forcer un reset" - OTA explicitement PAS implemente,
+    aucun mecanisme de relais OTA n'existe cote firmware a ce jour, aucune
+    invention ici) :
+      - "Prendre la main" : ouvre TRACKER_DETAIL_PAGE (cf. constante plus
+        bas) avec host/user/pass identiques + topic=<topic de base>/slave_
+        posX_posY - MEME mecanisme EXACT que crossPageUrl() dans
+        tracker_dashboard_13.html, juste un topic differe. Depuis cette
+        page de detail, TOUTES les actions existantes (auto/manu/axis/
+        repli/jog/raz_az/raz_tilt/nuit/ldr_offset) sont deja disponibles
+        telles quelles - AUCUNE modification necessaire sur ces 2 fichiers
+        existants, le relais ESP-NOW (LOT E) est totalement transparent
+        pour eux.
+      - "Manuel" / "Reset" : raccourcis directs depuis cette page (evite
+        d'ouvrir le detail juste pour ca) - publient {"cmd":"manu"} /
+        {"cmd":"reset"} sur <topic de base>/slave_posX_posY/cmd, MEME format
+        EXACT que ProcessRemoteMqttCommand() attend (fichier06) - "Reset"
+        demande confirmation (action perturbatrice, redemarre le tracker).
+
+    STATUT EN DIRECT : sous-produit du a LOT D (les topics slave_posX_posY
+    existent deja et sont deja publies par le Master, meme connexion MQTT
+    reutilisee) - abonnement explicite (PAS de wildcard MQTT, cf.
+    subscribeAllRows() plus bas) a exactement 1 topic par ligne du CSV/XLS
+    charge, mêmes 18 champs/memes cles EXACTES que
+    Core1PublishBacktrackDashFleet() (fichier08) : az/ti/md/sf/nt/ax/es/
+    lE/lO/lH/lB/wd/wM/bt/fb/rp/aM/tM - rien invente, verifie par lecture
+    directe du JSON construit cote firmware.
+  */
+  :root{
+    --bg:#0b0f14; --surface:#141b23; --surface2:#1b2530; --border:#26323f;
+    --text:#e8edf2; --text-muted:#8a97a6; --accent:#3b82f6;
+    --good:#22c55e; --warn:#f59e0b; --crit:#ef4444; --off:#3a4553;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg);z-index:5;flex-wrap:wrap;gap:8px;}
+  header h1{font-size:16px;margin:0;font-weight:600;}
+  #connDot{width:10px;height:10px;border-radius:50%;background:var(--crit);display:inline-block;margin-right:6px;}
+  #connDot.ok{background:var(--good);}
+  #connDot.warn{background:var(--warn);}
+  #connLabel{font-size:12px;color:var(--text-muted);}
+  main{max-width:1100px;margin:0 auto;padding:14px 12px 40px;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin:0 0 10px;font-weight:600;}
+  label{display:block;font-size:11px;color:var(--text-muted);margin-bottom:4px;margin-top:8px;}
+  input[type=text],input[type=password]{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 10px;font-size:14px;}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  .btn{background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;text-align:center;cursor:pointer;user-select:none;}
+  .btn:active{background:var(--accent);border-color:var(--accent);}
+  .btn.primary{background:var(--accent);border-color:var(--accent);}
+  .btn.crit{border-color:var(--crit);color:var(--crit);}
+  .btn.crit:active{background:var(--crit);color:#fff;}
+  .btn.small{padding:6px 10px;font-size:12px;flex:none;}
+  .hint{font-size:12px;color:var(--text-muted);margin-top:8px;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-muted);padding:8px 6px;border-bottom:1px solid var(--border);}
+  td{padding:8px 6px;border-bottom:1px solid var(--border);vertical-align:middle;}
+  tr:last-child td{border-bottom:none;}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;background:var(--off);}
+  .dot.ok{background:var(--good);}
+  .dot.stale{background:var(--warn);}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;background:var(--surface2);}
+  .badge.crit{background:var(--crit);color:#fff;}
+  .badge.warn{background:var(--warn);color:#241a00;}
+  .actions{display:flex;gap:6px;flex-wrap:wrap;}
+  .tableWrap{overflow-x:auto;}
+  #fileState{font-size:12px;color:var(--text-muted);}
+  a.linklike{color:inherit;text-decoration:none;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Tracker Solaire - Flotte Backtracking</h1>
+  <div><span id="connDot"></span><span id="connLabel">Non connecte</span></div>
+</header>
+
+<main>
+
+  <div class="card" id="backLinkCard">
+    <a class="btn small linklike" href="tracker_dashboard_accueil.html">&larr; Retour au choix du mode (flotte / tracker classique)</a>
+  </div>
+
+  <div class="card" id="connCard">
+    <h2>Connexion (MQTT du Master)</h2>
+    <label for="fHost">Host HiveMQ</label>
+    <input type="text" id="fHost" placeholder="xxxxxxxx.s1.eu.hivemq.cloud">
+    <label for="fUser">Utilisateur</label>
+    <input type="text" id="fUser">
+    <label for="fPass">Mot de passe</label>
+    <input type="password" id="fPass">
+    <label for="fTopic">Topic de base du Master</label>
+    <input type="text" id="fTopic" placeholder="tracker/status">
+    <label for="fToken">Jeton distant (si arme cote Master)</label>
+    <input type="password" id="fToken" placeholder="laisser vide si non utilise">
+    <div class="row" style="margin-top:12px;">
+      <div class="btn primary" id="btnConnect">Se connecter</div>
+    </div>
+    <div class="hint">Memes identifiants que le tableau de bord classique (tracker_dashboard.html) - c'est la connexion MQTT du Master, seule passerelle du champ (session).<br>
+      Le jeton distant (session, "un jeton porte par le master") est optionnel : sans session Admin/Root active sur CETTE page (il n'y en a jamais depuis un navigateur), il est INDISPENSABLE pour que Reset/Forcer secours/Forcer repli/Lever forcage/HS soient acceptees par un tracker relaye via ESP-NOW - inutile pour Auto/Manuel/axe/jog qui restent libres. Arme/change-le au Master via {"cmd":"set_remote_token","token":"..."} depuis une session Admin/Root reelle.</div>
+  </div>
+
+  <div class="card">
+    <h2>Liste des trackers</h2>
+    <div class="row">
+      <div class="btn small" id="btnReload">Recharger trackers.csv</div>
+      <label class="btn small" style="margin:0;">
+        Charger un fichier...
+        <input type="file" id="fFilePicker" accept=".csv,.xlsx,.xls" style="display:none;">
+      </label>
+      <span id="fileState">Aucune liste chargee.</span>
+    </div>
+    <div class="hint">Format attendu (1re ligne = en-tetes) : <code>posX,posY,nom</code> (nom optionnel) - depose <code>trackers.csv</code> a cote de cette page pour un chargement automatique, ou choisis un fichier CSV/XLS manuellement.</div>
+  </div>
+
+  <div class="card">
+    <h2>Flotte</h2>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Tracker</th>
+            <th>Position</th>
+            <th>Mode</th>
+            <th>Securite</th>
+            <th>Batterie</th>
+            <th>Derniere donnee</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="fleetBody">
+          <tr><td colspan="8" class="hint">Charge une liste de trackers puis connecte-toi pour voir le statut en direct.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>A propos</h2>
+    <div class="hint">
+      "Prendre la main" ouvre le tableau de bord detaille du tracker (topic pre-rempli automatiquement, meme mecanisme que le passage Auto/Manuel du tableau de bord classique) - toutes les commandes (Auto/Manuel/axe/repli/jog/RAZ/nuit/offsets LDR) y restent disponibles telles quelles, relayees de facon transparente par le Master via ESP-NOW si le tracker vise est un Slave silencieux (session, LOT E).<br>
+      "Manuel"/"Reset" sont des raccourcis directs depuis cette liste.<br>
+      OTA a distance n'est PAS implemente (aucun mecanisme cote firmware a ce jour) - a construire dans un lot dedie si besoin.
+    </div>
+  </div>
+
+</main>
+
+<script>
+(function(){
+  "use strict";
+
+  // Nom du fichier CSV auto-charge (session : "depose a cote du dashboard") -
+  // change ici si tu preferes un autre nom.
+  var CSV_FILENAME = "trackers.csv";
+  // Page de detail vers laquelle "Prendre la main" redirige (session, LOT F
+  // valide : "redirige vers tracker_dashboard.html/_manuel.html") - change
+  // ici si le nom reel deploye differe (ex: garde le suffixe "_13").
+  var TRACKER_DETAIL_PAGE = "tracker_dashboard.html";
+  // Au-dela de ce delai sans message recu, une ligne repasse "perime"
+  // (jamais supprimee, juste grisee) - meme ordre de grandeur que le
+  // balayage dashboard cote firmware (~1 min, LOT B).
+  var STALE_MS = 90 * 1000;
+
+  var qs = new URLSearchParams(window.location.search);
+  document.getElementById("fHost").value  = qs.get("host")  || "";
+  document.getElementById("fUser").value  = qs.get("user")  || "";
+  document.getElementById("fPass").value  = qs.get("pass")  || "";
+  document.getElementById("fTopic").value = qs.get("topic") || "";
+  document.getElementById("fToken").value = qs.get("token") || "";
+
+  var client = null;
+  var cfg = null;
+  // trackers : [{posX, posY, nom, lastSeenMs, data}]
+  var trackers = [];
+
+  function setConnState(state){
+    var dot = document.getElementById("connDot");
+    var lbl = document.getElementById("connLabel");
+    dot.className = (state === "ok") ? "ok" : (state === "connecting" ? "warn" : "");
+    lbl.textContent = (state === "ok") ? "Connecte" : (state === "connecting" ? "Connexion..." : "Non connecte");
+  }
+
+  function rowTopic(t){ return cfg.topic + "/slave_" + t.posX + "_" + t.posY; }
+  // LOT G (session, GO "ok lot g") - le topic de COMMANDE DU MASTER
+  // LUI-MEME (PAS celui d'un tracker) : "set_hs" modifie une bascule
+  // cote Master (BacktrackPeerTable[i].hs, fichier03/06) - il doit donc
+  // toujours etre publie ICI, jamais sur rowTopic(t)+"/cmd" (qui vise le
+  // tracker CONCERNE, pas le Master qui tient le registre).
+  function masterCmdTopic(){ return cfg.topic + "/cmd"; }
+
+  function connect(){
+    cfg = {
+      host:  document.getElementById("fHost").value.trim(),
+      user:  document.getElementById("fUser").value.trim(),
+      pass:  document.getElementById("fPass").value,
+      topic: document.getElementById("fTopic").value.trim(),
+      // session, "un jeton porte par le master" - optionnel, cf. hint de
+      // connCard : ajoute au payload JSON des commandes admin-only par
+      // publishCmd()/le publish direct de "set_hs" ci-dessous, jamais
+      // interprete localement (la verification a lieu UNIQUEMENT au
+      // Master, HiveMqCallback_Core1(), fichier08).
+      token: document.getElementById("fToken").value
+    };
+    if (!cfg.host || !cfg.topic) { alert("Host et Topic de base sont obligatoires."); return; }
+
+    setConnState("connecting");
+    var url = "wss://" + cfg.host + ":8884/mqtt";
+    client = mqtt.connect(url, {
+      username: cfg.user,
+      password: cfg.pass,
+      clientId: "flotte_" + Math.random().toString(16).slice(2),
+      reconnectPeriod: 3000,
+      connectTimeout: 8000
+    });
+
+    client.on("connect", function(){
+      setConnState("ok");
+      subscribeAllRows();
+    });
+    client.on("reconnect", function(){ setConnState("connecting"); });
+    client.on("close",     function(){ setConnState("off"); });
+    client.on("error",     function(e){ setConnState("off"); console.error("MQTT error", e); });
+
+    client.on("message", function(topic, payloadBuf){
+      var t = trackers.find(function(tr){ return rowTopic(tr) === topic; });
+      if (!t) return;
+      var data;
+      try { data = JSON.parse(payloadBuf.toString()); } catch(e){ return; }
+      t.lastSeenMs = Date.now();
+      t.data = data;
+      renderRow(t);
+    });
+  }
+
+  // Abonnement EXPLICITE a exactement 1 topic par tracker connu (PAS de
+  // wildcard MQTT, cf. commentaire d'entete) - reappele a chaque
+  // (re)chargement de la liste ET a chaque (re)connexion.
+  function subscribeAllRows(){
+    if (!client || !client.connected) return;
+    trackers.forEach(function(t){ client.subscribe(rowTopic(t)); });
+  }
+
+  function publishCmd(t, obj){
+    if (!client || !client.connected) { alert("Connecte-toi d'abord au MQTT du Master."); return; }
+    // session, "un jeton porte par le master" - ajoute automatiquement le
+    // jeton (si renseigne dans connCard) a TOUTE commande envoyee ici, y
+    // compris celles qui n'en ont pas besoin (auto/manu/axe/jog) : un champ
+    // "token" en trop y est simplement ignore cote firmware (seules les
+    // commandes admin-only le consultent via IsRemoteCommandAuthorized()).
+    if (cfg.token) obj.token = cfg.token;
+    client.publish(rowTopic(t) + "/cmd", JSON.stringify(obj));
+  }
+
+  // LOT G - "set_hs" vise le MASTER (masterCmdTopic()), PAS le tracker
+  // concerne (cf. commentaire de masterCmdTopic() ci-dessus).
+  function publishSetHs(t, hsOn){
+    if (!client || !client.connected) { alert("Connecte-toi d'abord au MQTT du Master."); return; }
+    var obj = {cmd:"set_hs", x:t.posX, y:t.posY, hs: hsOn ? 1 : 0};
+    // session, "un jeton porte par le master" - meme ajout que publishCmd()
+    // ci-dessus, "set_hs" fait partie des commandes admin-only.
+    if (cfg.token) obj.token = cfg.token;
+    client.publish(masterCmdTopic(), JSON.stringify(obj));
+  }
+
+  function detailUrl(t){
+    var p = new URLSearchParams();
+    p.set("host", cfg.host);
+    if (cfg.user) p.set("user", cfg.user);
+    if (cfg.pass) p.set("pass", cfg.pass);
+    p.set("topic", rowTopic(t));
+    // CORRECTIF (session, GO : "a bien remettre la protection !!!!") - le
+    // jeton distant n'etait PAS transmis ici (verifie) alors que host/user/
+    // pass/topic le sont deja : "Prendre la main" ouvrait donc
+    // tracker_dashboard.html SANS le jeton, qui doit desormais y etre
+    // ressaisi a la main (le dashboard classique le lit egalement en
+    // ?token=, cf. son propre commentaire) - sinon RAZ AZ/RAZ TILT/SECU y
+    // seraient rejetees en silence meme quand le jeton est deja configure
+    // ici, cote flotte.
+    if (cfg.token) p.set("token", cfg.token);
+    return TRACKER_DETAIL_PAGE + "?" + p.toString();
+  }
+
+  // ---- Parsing CSV (natif, aucune bibliotheque - meme discipline "pas de
+  // dependance inutile" que le reste) ----
+  function parseCsvText(text){
+    var lines = text.split(/\r\n|\n|\r/).filter(function(l){ return l.trim().length > 0; });
+    if (lines.length === 0) return [];
+    var header = lines[0].split(",").map(function(h){ return h.trim().toLowerCase(); });
+    var ixX = header.indexOf("posx");
+    var ixY = header.indexOf("posy");
+    var ixN = header.indexOf("nom");
+    if (ixX < 0 || ixY < 0) { alert("Fichier invalide : colonnes 'posX'/'posY' introuvables dans l'en-tete."); return []; }
+    var out = [];
+    for (var i = 1; i < lines.length; i++){
+      var cols = lines[i].split(",");
+      var px = parseInt(cols[ixX], 10);
+      var py = parseInt(cols[ixY], 10);
+      if (isNaN(px) || isNaN(py)) continue;
+      out.push({ posX: px, posY: py, nom: (ixN >= 0 && cols[ixN]) ? cols[ixN].trim() : null });
+    }
+    return out;
+  }
+
+  // ---- Parsing XLS/XLSX (SheetJS, cf. script CDN en tete de fichier) ----
+  function parseWorkbookRows(wb){
+    var sheet = wb.Sheets[wb.SheetNames[0]];
+    var rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, blankrows: false });
+    if (rows.length === 0) return [];
+    var header = rows[0].map(function(h){ return String(h || "").trim().toLowerCase(); });
+    var ixX = header.indexOf("posx");
+    var ixY = header.indexOf("posy");
+    var ixN = header.indexOf("nom");
+    if (ixX < 0 || ixY < 0) { alert("Fichier invalide : colonnes 'posX'/'posY' introuvables dans l'en-tete."); return []; }
+    var out = [];
+    for (var i = 1; i < rows.length; i++){
+      var cols = rows[i];
+      var px = parseInt(cols[ixX], 10);
+      var py = parseInt(cols[ixY], 10);
+      if (isNaN(px) || isNaN(py)) continue;
+      out.push({ posX: px, posY: py, nom: (ixN >= 0 && cols[ixN]) ? String(cols[ixN]).trim() : null });
+    }
+    return out;
+  }
+
+  function applyLoadedTrackers(list, sourceLabel){
+    trackers = list.map(function(t){ return { posX: t.posX, posY: t.posY, nom: t.nom, lastSeenMs: 0, data: null }; });
+    document.getElementById("fileState").textContent = trackers.length + " tracker(s) charge(s) - " + sourceLabel;
+    renderTable();
+    subscribeAllRows();
+  }
+
+  function loadFromCsvText(text, sourceLabel){
+    applyLoadedTrackers(parseCsvText(text), sourceLabel);
+  }
+
+  function loadFromArrayBuffer(buf, sourceLabel){
+    var wb = XLSX.read(buf, { type: "array" });
+    applyLoadedTrackers(parseWorkbookRows(wb), sourceLabel);
+  }
+
+  function tryAutoLoad(){
+    fetch(CSV_FILENAME).then(function(resp){
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.text();
+    }).then(function(text){
+      loadFromCsvText(text, "auto (" + CSV_FILENAME + ")");
+    }).catch(function(err){
+      document.getElementById("fileState").textContent =
+        "Chargement automatique de " + CSV_FILENAME + " impossible (" + err.message + ") - depose le fichier a cote de cette page sur un serveur web, ou utilise 'Charger un fichier...' ci-dessus.";
+    });
+  }
+
+  document.getElementById("btnReload").addEventListener("click", tryAutoLoad);
+
+  document.getElementById("fFilePicker").addEventListener("change", function(e){
+    var file = e.target.files[0];
+    if (!file) return;
+    var isXls = /\.xlsx?$/i.test(file.name);
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      if (isXls) loadFromArrayBuffer(ev.target.result, "fichier local (" + file.name + ")");
+      else        loadFromCsvText(ev.target.result, "fichier local (" + file.name + ")");
+    };
+    if (isXls) reader.readAsArrayBuffer(file);
+    else        reader.readAsText(file);
+  });
+
+  // ---- Rendu ----
+  function fmtAgo(ms){
+    if (!ms) return "--";
+    var s = Math.round((Date.now() - ms) / 1000);
+    if (s < 60) return s + " s";
+    var m = Math.round(s / 60);
+    if (m < 60) return m + " min";
+    return Math.round(m / 60) + " h";
+  }
+
+  function rowId(t){ return "row_" + t.posX + "_" + t.posY; }
+
+  function renderTable(){
+    var body = document.getElementById("fleetBody");
+    body.innerHTML = "";
+    if (trackers.length === 0){
+      body.innerHTML = '<tr><td colspan="8" class="hint">Aucun tracker charge.</td></tr>';
+      return;
+    }
+    trackers.forEach(function(t){
+      var tr = document.createElement("tr");
+      tr.id = rowId(t);
+      body.appendChild(tr);
+      renderRow(t);
+    });
+  }
+
+  function renderRow(t){
+    var tr = document.getElementById(rowId(t));
+    if (!tr) return;
+    var stale = t.lastSeenMs && (Date.now() - t.lastSeenMs > STALE_MS);
+    var dotClass = !t.lastSeenMs ? "" : (stale ? "stale" : "ok");
+    var d = t.data || {};
+    var nom = t.nom || ("Tracker (" + t.posX + "," + t.posY + ")");
+
+    var safetyBadge = d.sf === "ALARME" ? '<span class="badge crit">ALARME</span>' :
+                       (d.sf ? '<span class="badge">OK</span>' : "--");
+    if (d.es) safetyBadge += ' <span class="badge warn">ESTOP</span>';
+    // LOT G (session, GO "ok lot g") - badge HS bien visible, prioritaire
+    // visuellement (place en 1er) : un tracker HS reste affiche (pas
+    // masque) mais sa ligne se distingue immediatement.
+    if (d.hs) safetyBadge = '<span class="badge crit">HS</span> ' + safetyBadge;
+
+    tr.innerHTML =
+      '<td><span class="dot ' + dotClass + '"></span></td>' +
+      '<td>' + nom + '</td>' +
+      '<td>' + t.posX + ', ' + t.posY + '</td>' +
+      '<td>' + (d.md || "--") + '</td>' +
+      '<td>' + safetyBadge + '</td>' +
+      '<td>' + (typeof d.bt === "number" ? d.bt.toFixed(2) + " V" : "--") + '</td>' +
+      '<td>' + fmtAgo(t.lastSeenMs) + '</td>' +
+      '<td class="actions">' +
+        '<a class="btn small linklike" href="' + (cfg ? detailUrl(t) : "#") + '" target="_blank">Prendre la main</a>' +
+        '<span class="btn small" data-act="manu">Manuel</span>' +
+        '<span class="btn small" data-act="secours">Force secours</span>' +
+        '<span class="btn small" data-act="repli">Force repli</span>' +
+        '<span class="btn small" data-act="clear">Leve forcage</span>' +
+        '<span class="btn small" data-act="hs">' + (d.hs ? "Retire HS" : "Declare HS") + '</span>' +
+        '<span class="btn small crit" data-act="reset">Reset</span>' +
+      '</td>';
+
+    tr.querySelector('[data-act="manu"]').addEventListener("click", function(){
+      publishCmd(t, {cmd:"manu"});
+    });
+    tr.querySelector('[data-act="reset"]').addEventListener("click", function(){
+      if (confirm("Redemarrer " + nom + " maintenant ?")) publishCmd(t, {cmd:"reset"});
+    });
+    // LOT G - "force_secours"/"force_repli"/"force_clear" visent le
+    // tracker CONCERNE (rowTopic, via publishCmd()) - le Master relaye en
+    // ESP-NOW de facon transparente si c'est un Slave silencieux (LOT E).
+    tr.querySelector('[data-act="secours"]').addEventListener("click", function(){
+      if (confirm("Forcer " + nom + " a suivre sa courbe de secours des maintenant, jusqu'a nouvel ordre ?")) publishCmd(t, {cmd:"force_secours"});
+    });
+    tr.querySelector('[data-act="repli"]').addEventListener("click", function(){
+      if (confirm("Forcer " + nom + " en position de repli, jusqu'a nouvel ordre ?")) publishCmd(t, {cmd:"force_repli"});
+    });
+    tr.querySelector('[data-act="clear"]').addEventListener("click", function(){
+      publishCmd(t, {cmd:"force_clear"});
+    });
+    // "set_hs" vise le MASTER (publishSetHs()), PAS ce tracker - cf.
+    // commentaire de masterCmdTopic().
+    tr.querySelector('[data-act="hs"]').addEventListener("click", function(){
+      var next = !d.hs;
+      if (confirm((next ? "Declarer " : "Retirer le statut HS de ") + nom + " ?")) publishSetHs(t, next);
+    });
+  }
+
+  setInterval(function(){ trackers.forEach(renderRow); }, 5000);   // rafraichit "Derniere donnee"/etat perime meme sans nouveau message
+
+  document.getElementById("btnConnect").addEventListener("click", connect);
+
+  tryAutoLoad();
+})();
+</script>
+
+</body>
+</html>
