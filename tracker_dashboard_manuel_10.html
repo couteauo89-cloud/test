@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tracker Solaire - Manuel</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  /*
+    FICHIER DERIVE (session, GO : "on fait la meme dans le 2eme html mais
+    pour le rendu du mode manuel") - copie de tracker_dashboard.html, dont
+    seule la zone centrale "Auto" (logo tracker, icones prevision,
+    fleches azimut/tilt clignotantes - DrawTrackerLogoFromSD/
+    DrawTrackerForecastIcons/DrawTrackerArrowOverlays du .ino) a ete
+    retiree : ce fichier n'affiche QUE la zone centrale "Manu"
+    (DrawManualJogControls/DrawAs5600Gauges), en permanence (plus de
+    bascule display:none pilotee par un onglet). Bandeau superieur (LDR/
+    vent), colonnes gauche/droite (AUTO/MANU/AXE/RAZ/SECU/NUIT/...),
+    connexion MQTT, cartes Prevision/Etat : IDENTIQUES au fichier source,
+    memes coordonnees .ino, memes commandes (flechesjog = start/stop
+    moteur au clic/maintien, STOP arme/confirme, RAZ AZ/TILT/NUIT
+    arme/confirme). Toute correction faite ici doit etre reportee dans
+    tracker_dashboard.html si elle concerne une partie commune aux 2
+    fichiers (les 2 ne sont PAS generes automatiquement l'un depuis
+    l'autre - divergence possible si edite un seul cote).
+  */
+  :root{
+    --bg:#0b0f14; --surface:#141b23; --surface2:#1b2530; --border:#26323f;
+    --text:#e8edf2; --text-muted:#8a97a6; --accent:#3b82f6;
+    --good:#22c55e; --warn:#f59e0b; --crit:#ef4444; --off:#3a4553;
+
+    /* Palette ecran Mode Run (cf. commentaire ci-dessus) */
+    --tft-bg:#000000;
+    --tft-select:#ff0000;        /* THEME_SELECT (defaut) */
+    --tft-selecttext:#ffffff;    /* THEME_SELECTTEXT (defaut) */
+    --tft-highlight:#ffbe73;     /* THEME_HIGHLIGHT (defaut, orange clair) */
+    --tft-fg:#ffffff;            /* THEME_FG_TFT */
+    --tft-green:#00ff00; --tft-red:#ff0000; --tft-yellow:#ffff00;
+    --tft-orange:#ffa500; --tft-darkgrey:#7b7d7b; --tft-maroon:#7b0000;
+    --tft-tabbg:#bedcff;         /* color565(190,220,255) */
+    --tft-logobg:#d2e1f5;        /* color565(210,225,245) */
+    /* AJOUT (session, GO : "L'ENSEMBLE des couleurs ... aux pixel pres") -
+       ST7796S_DARKGREEN (0x03E0) - meme conversion EXACTE que
+       tracker_dashboard.html, cf. son propre commentaire pour le detail. */
+    --tft-darkgreen:#007d00;
+    /* AJOUT (session, GO "ajoute les icons de coin... meteo concept") -
+       memes 4 teintes EXACTES que tracker_dashboard.html, cf. son propre
+       commentaire pour le detail (icones vectorielles dashboard, pas de
+       bitmap .bin accessible depuis un navigateur). */
+    --tft-cloudlight:#d7dde3; --tft-clouddark:#8a9099;
+    --tft-skyblue:#4a90d9; --tft-icewhite:#eaf4ff;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg);z-index:5;}
+  header h1{font-size:16px;margin:0;font-weight:600;}
+  #connDot{width:10px;height:10px;border-radius:50%;background:var(--crit);display:inline-block;margin-right:6px;}
+  #connDot.ok{background:var(--good);}
+  #connDot.warn{background:var(--warn);}
+  #connLabel{font-size:12px;color:var(--text-muted);}
+  main{max-width:960px;margin:0 auto;padding:14px 12px 40px;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin:0 0 10px;font-weight:600;}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+  .tile{background:var(--surface2);border-radius:10px;padding:10px 8px;text-align:center;}
+  .tile .lbl{font-size:11px;color:var(--text-muted);margin-bottom:4px;}
+  .tile .val{font-size:18px;font-weight:700;}
+  .row{display:flex;gap:8px;flex-wrap:wrap;}
+  .btn{flex:1;min-width:90px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:12px 8px;font-size:13px;font-weight:600;text-align:center;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:manipulation;}
+  .btn:active{background:var(--accent);border-color:var(--accent);}
+  .btn.on{background:var(--accent);border-color:var(--accent);}
+  .btn.armed{background:var(--warn);border-color:var(--warn);color:#1a1200;}
+  .hint{font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.4;}
+  input[type=text],input[type=password],input[type=number]{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;font-size:14px;margin-bottom:8px;}
+  label{font-size:12px;color:var(--text-muted);display:block;margin-bottom:3px;}
+  #loginCard .btn{background:var(--accent);border-color:var(--accent);}
+  #dash{display:none;}
+
+  /* ---- Ecran Mode Run (SVG, viewBox 0 0 480 320) ---- */
+  #screenWrap{width:100%;max-width:960px;aspect-ratio:3/2;margin:0 auto 12px;border-radius:14px;overflow:hidden;border:1px solid var(--border);background:var(--tft-bg);}
+  #screenSvg{width:100%;height:100%;display:block;touch-action:manipulation;}
+  .svgTxt{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;fill:var(--tft-fg);user-select:none;}
+  .colBtn, .tabBtn, .jogBtn{cursor:pointer;}
+  .colBtn rect, .jogBtn rect{transition:fill .1s;}
+  /* MISE A NIVEAU (session, GO : "le dashboard tracker simple est pas mis
+     a jour") - ce fichier avait pris du retard sur tracker_dashboard.html
+     (aide contextuelle, alarme vent plein cadre, jeton distant) : ports
+     ci-dessous verifies ligne a ligne contre la version actuelle de ce
+     fichier source, cf. commentaire d'entete "toute correction faite ici
+     doit etre reportee dans tracker_dashboard.html [et vice-versa]". */
+  .helpBox{background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;margin:-6px 0 12px;font-size:24px;line-height:1.45;}
+  .helpBox .helpTitle{font-weight:700;color:var(--accent);font-size:20px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;}
+  .helpBox.hidden{display:none;}
+  .wsBlocked{pointer-events:none;opacity:0.55;}
+  #windAlarmOverlay .waIcon{animation:waBlink 0.8s steps(1) infinite;}
+  @keyframes waBlink{0%,49%{opacity:1;}50%,100%{opacity:0;}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Tracker Solaire - Manuel</h1>
+  <div>
+    <!-- AJOUT (session, GO : "je t'envoie les html a mettre a jour...") -
+         meme badge EXACT que tracker_dashboard.html (champ "hs", message
+         "ex" - SelfHsAlarmActive, fichier03 du .ino) : meme tracker, meme
+         etat, doit se voir ici aussi quelle que soit la page ouverte. -->
+    <span id="hsBadge" class="hint" style="display:none;color:#ffffff;background:var(--crit);border-radius:999px;padding:2px 10px;font-weight:700;margin-right:8px;">HS</span>
+    <span id="connDot"></span><span id="connLabel">Non connecte</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Formulaire de connexion MQTT (identifiants du broker configure sur le tracker, Sans-fil > Menu MQTT) -->
+  <div class="card" id="loginCard">
+    <h2>Connexion MQTT (une seule fois)</h2>
+    <label for="fHost">TLS websocket url (ex: xxxx.s1.eu.hivemq.cloud)</label>
+    <input type="text" id="fHost" placeholder="xxxx.s1.eu.hivemq.cloud">
+    <label for="fUser">Utilisateur</label>
+    <input type="text" id="fUser">
+    <label for="fPass">Mot de passe</label>
+    <input type="password" id="fPass">
+    <label for="fTopic">Topic (identique a celui du tracker)</label>
+    <input type="text" id="fTopic" placeholder="tracker/status">
+    <!-- AJOUT (session, GO : "a bien remettre la protection !!!!") - meme
+         champ/meme role EXACT que tracker_dashboard.html : sans lui, RAZ
+         AZ/RAZ TILT/SECU sont TOUJOURS rejetees en silence par
+         IsRemoteCommandAuthorized() (fichier06 du .ino). -->
+    <label for="fToken">Jeton distant (si arme cote tracker)</label>
+    <input type="password" id="fToken" placeholder="laisser vide si non utilise">
+    <div class="row"><div class="btn" id="btnConnect">Se connecter</div></div>
+    <div class="hint">
+      Connexion via WebSocket securise (wss://host:8884/mqtt) - le port 8884
+      est fixe cote navigateur, meme si le tracker utilise 8883 de son cote.
+      Ces identifiants sont ceux deja saisis sur le tracker (portail
+      telephone ou Sans-fil > Menu MQTT) - rien n'est enregistre dans ce
+      navigateur, a ressaisir a chaque ouverture si tu n'utilises pas le
+      lien/QR complet genere par le tracker.<br>
+      Le jeton distant est optionnel : sans session Admin/Root active sur
+      CETTE page (il n'y en a jamais depuis un navigateur), il est
+      INDISPENSABLE pour que RAZ AZ/RAZ TILT/SECU (repli) soient acceptees -
+      inutile pour Auto/Manuel/axe/jog/nuit/offsets LDR qui restent libres.
+      Arme/change-le au tracker via {"cmd":"set_remote_token","token":"..."}
+      depuis une session Admin/Root reelle (Admin > Administration).
+    </div>
+  </div>
+
+  <div id="dash">
+
+    <!-- Replique ecran Mode Run (Auto/Manu) - coordonnees .ino, cf. commentaire CSS -->
+    <div id="screenWrap">
+      <svg id="screenSvg" viewBox="0 0 480 320" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="0" width="480" height="320" fill="var(--tft-bg)"/>
+
+        <!-- AJOUT (session, GO "ajoute les icons de coin... meteo concept") -
+             memes 2 groupes EXACTS que tracker_dashboard.html (cf. son propre
+             commentaire pour le detail). -->
+        <g id="cornerWeather"></g>
+        <!-- CORRECTIF (session, GO code, "la meteo du tracker est toujours
+             openweather je devrais avoir le choix") - meme <image> dediee
+             EXACTE que tracker_dashboard.html (cf. son propre commentaire
+             pour le detail : soeur de #cornerWeather, href xlink, affichee
+             uniquement quand "wp"=0). -->
+        <image id="cornerWeatherImg" x="0" y="0" width="40" height="40" style="visibility:hidden"/>
+        <g id="cornerWind"></g>
+
+        <!-- Bandeau superieur : 5 onglets LDR E/O/H/B + Vent (DrawModeRunTopTabs, x=40+i*80, w=78, h=40) -->
+        <g id="topTabs" font-size="7">
+          <!-- genere en JS (buildTopTabs()) -->
+        </g>
+
+        <!-- Colonne gauche : AUTO/MANU/AXE/RAZ AZ/RAZ TILT (DrawModeRunLeftColumn, x=0, w=40, y=42+40*i, h=39) -->
+        <g id="leftCol"></g>
+
+        <!-- Colonne droite : SECU/REC/NUIT/LEVER/EXIT (DrawModeRunRightColumn, x=440, w=40) -->
+        <g id="rightCol"></g>
+
+        <!-- Zone centrale : bascule Auto <-> Manu (DrawModeRunUnified, x=50 y=40 w=380 h=233) -->
+
+        <g id="centralManu">
+          <!-- Pave directionnel + STOP (DrawManualJogControls) -->
+          <g id="jogPad">
+            <rect id="jogUp" class="jogBtn" data-jog="up" x="170" y="67" width="140" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="240,76 230,96 250,96" fill="var(--tft-orange)"/>
+            <rect id="jogDown" class="jogBtn" data-jog="down" x="170" y="231" width="140" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="240,260 230,240 250,240" fill="var(--tft-orange)"/>
+            <rect id="jogWest" class="jogBtn" data-jog="west" x="65" y="149" width="80" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="72,168 92,158 92,178" fill="var(--tft-orange)"/>
+            <rect id="jogEast" class="jogBtn" data-jog="east" x="335" y="149" width="80" height="38" rx="4" fill="var(--tft-bg)" stroke="var(--tft-fg)"/>
+            <polygon points="408,168 388,158 388,178" fill="var(--tft-orange)"/>
+            <rect id="btnEstopSvg" x="180" y="149" width="120" height="38" rx="4" fill="var(--tft-red)" stroke="#fff" style="cursor:pointer"/>
+            <text id="estopTxt1" x="240" y="164" text-anchor="middle" class="svgTxt" font-size="9" font-weight="700">ARRET</text>
+            <text id="estopTxt2" x="240" y="177" text-anchor="middle" class="svgTxt" font-size="9" font-weight="700">D'URGENCE</text>
+          </g>
+          <!-- Jauges AS5600 Azimut (cx=105) / Tilt (cx=375), cy=96, r=40 -->
+          <g id="gaugeAz"></g>
+          <g id="gaugeTilt"></g>
+        </g>
+
+        <!-- AJOUT (session, GO : "il faut remonter le gros rectangle rouge
+             'do not touch'.. et bloquer le dashboard le temps du compte a
+             rebourt!") - port EXACT depuis tracker_dashboard.html (memes
+             coordonnees, meme texte, cf. son propre commentaire). -->
+        <g id="windAlarmOverlay" style="display:none">
+          <rect x="50" y="40" width="380" height="233" fill="var(--tft-red)"/>
+          <text class="waIcon" x="90" y="120" text-anchor="middle" font-size="28" style="fill:#ffffff">&#9888;</text>
+          <text class="waIcon" x="390" y="120" text-anchor="middle" font-size="28" style="fill:#ffffff">&#9888;</text>
+          <text class="svgTxt" x="240" y="118" text-anchor="middle" font-size="18" font-weight="700" style="fill:#ffffff">SECURITE</text>
+          <text class="svgTxt" x="240" y="145" text-anchor="middle" font-size="14" font-weight="700" style="fill:#ffffff">NE TOUCHEZ A RIEN</text>
+          <text id="windAlarmCountdown" class="svgTxt" x="240" y="185" text-anchor="middle" font-size="14" font-weight="700" style="fill:#ffffff">Retour dans : 00:00 mn</text>
+        </g>
+      </svg>
+    </div>
+    <!-- AJOUT (session, GO : "il faut se mettre a la place d'un user lambda
+         et le guider... donc TOUT le menu, TOUT les appuis affiche une aide
+         PARTOUT") - port EXACT depuis tracker_dashboard.html. -->
+    <div class="helpBox" id="dashHelpBox">
+      <div class="helpTitle" id="dashHelpTitle">Aide</div>
+      <div id="dashHelpText">Touche ou survole un bouton de l'ecran ci-dessus (colonnes, fleches, ARRET D'URGENCE) pour voir ici ce qu'il fait exactement, avant de l'utiliser.</div>
+    </div>
+    <div class="hint" style="margin:-6px 0 12px;">Ecran interactif : tape AUTO/MANU/AXE/RAZ/SECU/NUIT/EXIT dans les colonnes, ou les fleches/STOP en mode Manu - memes commandes que l'ecran local.</div>
+
+    <div class="card">
+      <h2>Prevision (detail)</h2>
+      <div class="hint">Seuil nuit actuel : <span id="vNightThreshold">--</span> &nbsp;|&nbsp; Offsets LDR E/O/H/B : <span id="vOffE">--</span>/<span id="vOffO">--</span>/<span id="vOffH">--</span>/<span id="vOffB">--</span></div>
+      <div class="row" style="margin-top:8px;">
+        <div class="btn" data-ldr="E" data-delta="-10">LDR E -10</div><div class="btn" data-ldr="E" data-delta="10">LDR E +10</div>
+        <div class="btn" data-ldr="O" data-delta="-10">LDR O -10</div><div class="btn" data-ldr="O" data-delta="10">LDR O +10</div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div class="btn" data-ldr="H" data-delta="-10">LDR H -10</div><div class="btn" data-ldr="H" data-delta="10">LDR H +10</div>
+        <div class="btn" data-ldr="B" data-delta="-10">LDR B -10</div><div class="btn" data-ldr="B" data-delta="10">LDR B +10</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Etat</h2>
+      <div class="hint" id="vLastSeenLine">Derniere donnee recue : <span id="vLastSeen">--</span></div>
+      <div class="hint">Le deverrouillage de l'arret d'urgence n'est volontairement pas disponible depuis ce tableau de bord - uniquement en local, Admin &gt; Moteur sur le tracker.</div>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---- Connexion (inchange) ----
+  var qs = new URLSearchParams(window.location.search);
+  var initial = {
+    host:  qs.get("host")  || "",
+    user:  qs.get("user")  || "",
+    pass:  qs.get("pass")  || "",
+    topic: qs.get("topic") || "tracker/status",
+    token: qs.get("token") || ""
+  };
+  document.getElementById("fHost").value  = initial.host;
+  document.getElementById("fUser").value  = initial.user;
+  document.getElementById("fPass").value  = initial.pass;
+  document.getElementById("fTopic").value = initial.topic;
+  document.getElementById("fToken").value = initial.token;
+
+  var client = null;
+  var cfg = null;
+  var lastSeenMs = 0;
+  var lastStatus = null;   // dernier message frequent recu (az/ti/md/...)
+  var wsDisplayedTab = "AUTO"; // onglet actuellement affiche cote dashboard (AUTO|MANU), meme role que WsDisplayedTab cote .ino
+
+  function cmdTopic(){ return cfg.topic + "/cmd"; }
+
+  // AJOUT (session, GO : "il faut un retour au mode auto, on doit pas
+  // rester bloque sur la page manu") - construit l'URL de l'autre page
+  // (tracker_dashboard.html) avec les memes identifiants MQTT deja
+  // saisis ici, pour ne pas avoir a les resaisir en y arrivant (meme
+  // mecanique que celle deja prevue par ce fichier pour se pre-remplir
+  // depuis l'URL, cf. plus bas "var qs = new URLSearchParams(...)").
+  function crossPageUrl(page){
+    if (!cfg) return null;
+    var p = new URLSearchParams();
+    p.set("host", cfg.host);
+    if (cfg.user) p.set("user", cfg.user);
+    if (cfg.pass) p.set("pass", cfg.pass);
+    p.set("topic", cfg.topic);
+    // AJOUT (session, GO : "a bien remettre la protection !!!!") - port
+    // EXACT depuis tracker_dashboard.html : le jeton suivait deja host/
+    // user/pass/topic sauf lui-meme.
+    if (cfg.token) p.set("token", cfg.token);
+    return page + "?" + p.toString();
+  }
+
+  function setConnState(state){
+    var dot = document.getElementById("connDot");
+    var lbl = document.getElementById("connLabel");
+    dot.className = (state === "ok") ? "ok" : (state === "connecting" ? "warn" : "");
+    lbl.textContent = (state === "ok") ? "Connecte" : (state === "connecting" ? "Connexion..." : "Non connecte");
+  }
+
+  function connect(){
+    cfg = {
+      host:  document.getElementById("fHost").value.trim(),
+      user:  document.getElementById("fUser").value.trim(),
+      pass:  document.getElementById("fPass").value,
+      topic: document.getElementById("fTopic").value.trim() || "tracker/status",
+      // AJOUT (session, GO : "a bien remettre la protection !!!!") - port
+      // EXACT depuis tracker_dashboard.html.
+      token: document.getElementById("fToken").value
+    };
+    if (!cfg.host || !cfg.topic) { alert("Host et Topic sont obligatoires."); return; }
+
+    setConnState("connecting");
+    var url = "wss://" + cfg.host + ":8884/mqtt";
+    client = mqtt.connect(url, {
+      username: cfg.user,
+      password: cfg.pass,
+      clientId: "dashboard_" + Math.random().toString(16).slice(2),
+      reconnectPeriod: 3000,
+      connectTimeout: 8000
+    });
+
+    client.on("connect", function(){
+      setConnState("ok");
+      document.getElementById("loginCard").style.display = "none";
+      document.getElementById("dash").style.display = "block";
+      client.subscribe(cfg.topic);
+    });
+    client.on("reconnect", function(){ setConnState("connecting"); });
+    client.on("close",     function(){ setConnState("off"); });
+    client.on("error",     function(e){ setConnState("off"); console.error("MQTT error", e); });
+
+    client.on("message", function(topic, payloadBuf){
+      if (topic !== cfg.topic) return;
+      var data;
+      try { data = JSON.parse(payloadBuf.toString()); } catch(e){ return; }
+      if (data.t === "ex") { renderExtra(data); return; }
+      lastSeenMs = Date.now();
+      lastStatus = data;
+      renderStatus(data);
+    });
+  }
+
+  function publishCmd(obj, onAck){
+    if (!client || !client.connected) return;
+    // AJOUT (session, GO : "a bien remettre la protection !!!!") - port
+    // EXACT depuis tracker_dashboard.html : sans ca, RAZ AZ/RAZ TILT/SECU
+    // etaient TOUJOURS rejetees en silence depuis cette page.
+    if (cfg.token) obj.token = cfg.token;
+    // CORRECTIF (session, GO : "le tracker reste en auto [...] CEST UNE
+    // QUESTION DE SECURITE") - QoS 1 (au lieu du QoS 0 par defaut de
+    // MQTT.js, fire-and-forget) + callback optionnel (onAck), appele
+    // uniquement quand le broker a reellement accuse reception (PUBACK) du
+    // message. Sert ici a ne quitter cette page (clic AUTO, ci-dessous) que
+    // lorsque la commande est confirmee partie, plutot que sur un delai fixe
+    // devine qui pouvait couper la connexion WS avant meme l'envoi reel.
+    client.publish(cmdTopic(), JSON.stringify(obj), {qos: 1}, function(err){
+      if (onAck) onAck(!err);
+    });
+  }
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function svgEl(tag, attrs){
+    var el = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+
+  // ---- Icones de coin (session, GO "ajoute les icons de coin... meteo
+  // concept") - MEMES fonctions EXACTES que tracker_dashboard.html, cf. son
+  // propre commentaire pour le detail de chaque sous-composant/categorie.
+  function iconSun(g, cx, cy, r){
+    g.appendChild(svgEl("circle", {cx:cx, cy:cy, r:r, fill:"var(--tft-yellow)"}));
+    for (var i = 0; i < 8; i++){
+      var ang = i * Math.PI / 4;
+      var x1 = cx + (r+2)*Math.cos(ang), y1 = cy + (r+2)*Math.sin(ang);
+      var x2 = cx + (r+4.5)*Math.cos(ang), y2 = cy + (r+4.5)*Math.sin(ang);
+      g.appendChild(svgEl("line", {x1:x1, y1:y1, x2:x2, y2:y2, stroke:"var(--tft-yellow)", "stroke-width":1.5, "stroke-linecap":"round"}));
+    }
+  }
+  function iconCloud(g, cx, cy, s, color){
+    g.appendChild(svgEl("rect",    {x:cx-10*s, y:cy-2*s, width:20*s, height:8*s, rx:4*s, fill:color}));
+    g.appendChild(svgEl("circle",  {cx:cx-6*s, cy:cy-3*s, r:5*s, fill:color}));
+    g.appendChild(svgEl("circle",  {cx:cx,     cy:cy-6*s, r:6*s, fill:color}));
+    g.appendChild(svgEl("circle",  {cx:cx+6*s, cy:cy-3*s, r:5*s, fill:color}));
+  }
+  function iconFogLines(g, ox, oy){
+    for (var i = 0; i < 4; i++){
+      g.appendChild(svgEl("line", {x1:ox+4, y1:oy+8+i*7, x2:ox+36, y2:oy+8+i*7, stroke:"var(--tft-cloudlight)", "stroke-width":2.4, "stroke-linecap":"round", opacity:0.85}));
+    }
+  }
+  function iconRainDrops(g, ox, oy, color){
+    for (var i = 0; i < 3; i++){
+      var dx = ox + 13 + i*7;
+      g.appendChild(svgEl("ellipse", {cx:dx, cy:oy+31, rx:1.4, ry:3, fill:(color||"var(--tft-skyblue)"), transform:"rotate(10 " + dx + " " + (oy+31) + ")"}));
+    }
+  }
+  function iconSnowFlakes(g, ox, oy){
+    for (var i = 0; i < 3; i++){
+      var fx = ox + 13 + i*7, fy = oy + 31;
+      g.appendChild(svgEl("line", {x1:fx-2.2, y1:fy, x2:fx+2.2, y2:fy, stroke:"var(--tft-icewhite)", "stroke-width":1.3, "stroke-linecap":"round"}));
+      g.appendChild(svgEl("line", {x1:fx, y1:fy-2.2, x2:fx, y2:fy+2.2, stroke:"var(--tft-icewhite)", "stroke-width":1.3, "stroke-linecap":"round"}));
+    }
+  }
+  function iconHail(g, ox, oy){
+    for (var i = 0; i < 3; i++){
+      g.appendChild(svgEl("circle", {cx:ox+13+i*7, cy:oy+31, r:1.8, fill:"var(--tft-icewhite)", stroke:"var(--tft-cloudlight)", "stroke-width":0.5}));
+    }
+  }
+  function iconBolt(g, ox, oy){
+    var pts = [(ox+22)+","+(oy+26), (ox+17)+","+(oy+33), (ox+20)+","+(oy+33), (ox+16)+","+(oy+40)].join(" ");
+    g.appendChild(svgEl("polygon", {points:pts, fill:"var(--tft-orange)"}));
+  }
+  function meteoConceptIconCategory(code){
+    if (code === null || code === undefined || code < 0) return null;
+    switch (code){
+      case 0:  return "sun";
+      case 1:  return "sun_cloud";
+      case 2:  return "haze";
+      case 3:  return "cloud_partial";
+      case 4:  return "cloud_much";
+      case 5:  return "cloud_full";
+      case 6: case 7: return "fog";
+      case 10: case 11: case 12: case 16: return "rain";
+      case 13: case 14: case 15: return "rain_ice";
+      case 20: case 21: case 22: return "snow";
+      case 30: case 31: case 32: return "sleet";
+      case 40: case 41: case 42: return "showers_rain";
+      case 43: case 44: case 45: return "showers_storm";
+      case 46: case 47: case 48: return "showers_snow";
+      case 60: case 61: case 62: return "sleet_showers";
+      case 63: case 64: case 65: return "hail";
+      case 70: case 71: case 72: return "storm";
+      case 73: case 74: case 75: return "storm_snow";
+      default: return null;
+    }
+  }
+  var lastWeatherIconCategory = undefined;
+  // CORRECTIF (session, GO code, "la meteo du tracker est toujours
+  // openweather je devrais avoir le choix") : meme branchement "wp" EXACT
+  // que tracker_dashboard.html (cf. son propre commentaire pour le detail).
+  function updateCornerWeatherIcon(wp, code, owmCode){
+    var img = document.getElementById("cornerWeatherImg");
+    var g = document.getElementById("cornerWeather");
+    if (wp === 0){
+      var key = "owm:" + (owmCode || "");
+      if (key === lastWeatherIconCategory) return;
+      lastWeatherIconCategory = key;
+      while (g.firstChild) g.removeChild(g.firstChild);
+      if (!owmCode) { img.style.visibility = "hidden"; return; }
+      img.setAttributeNS("http://www.w3.org/1999/xlink", "href", "https://openweathermap.org/img/wn/" + owmCode + "@2x.png");
+      img.style.visibility = "visible";
+      return;
+    }
+    img.style.visibility = "hidden";
+    var cat = meteoConceptIconCategory(code);
+    var catKey = "mc:" + cat;
+    if (catKey === lastWeatherIconCategory) return;
+    lastWeatherIconCategory = catKey;
+    while (g.firstChild) g.removeChild(g.firstChild);
+    if (!cat) return;
+    var ox = 0, oy = 0;
+    switch (cat){
+      case "sun":            iconSun(g, ox+20, oy+20, 8); break;
+      case "sun_cloud":      iconSun(g, ox+13, oy+14, 6); iconCloud(g, ox+25, oy+26, 0.85, "var(--tft-cloudlight)"); break;
+      case "haze":           iconSun(g, ox+20, oy+16, 7); iconFogLines(g, ox, oy+14); break;
+      case "cloud_partial":  iconSun(g, ox+12, oy+13, 5); iconCloud(g, ox+24, oy+24, 1.0, "var(--tft-cloudlight)"); break;
+      case "cloud_much":     iconCloud(g, ox+20, oy+22, 1.15, "var(--tft-cloudlight)"); iconCloud(g, ox+14, oy+17, 0.6, "var(--tft-clouddark)"); break;
+      case "cloud_full":     iconCloud(g, ox+20, oy+22, 1.3, "var(--tft-clouddark)"); break;
+      case "fog":             iconFogLines(g, ox, oy); break;
+      case "rain":            iconCloud(g, ox+20, oy+18, 1.1, "var(--tft-clouddark)"); iconRainDrops(g, ox, oy); break;
+      case "rain_ice":        iconCloud(g, ox+20, oy+18, 1.1, "var(--tft-clouddark)"); iconRainDrops(g, ox, oy, "var(--tft-icewhite)"); break;
+      case "snow":            iconCloud(g, ox+20, oy+18, 1.1, "var(--tft-clouddark)"); iconSnowFlakes(g, ox, oy); break;
+      case "sleet":           iconCloud(g, ox+20, oy+18, 1.1, "var(--tft-clouddark)"); iconRainDrops(g, ox-6, oy); iconSnowFlakes(g, ox+6, oy); break;
+      case "showers_rain":    iconSun(g, ox+12, oy+12, 5); iconCloud(g, ox+22, oy+20, 1.05, "var(--tft-cloudlight)"); iconRainDrops(g, ox, oy); break;
+      case "showers_storm":   iconCloud(g, ox+20, oy+17, 1.1, "var(--tft-clouddark)"); iconBolt(g, ox-2, oy-6); iconRainDrops(g, ox+8, oy-2); break;
+      case "showers_snow":    iconSun(g, ox+12, oy+12, 5); iconCloud(g, ox+22, oy+20, 1.05, "var(--tft-cloudlight)"); iconSnowFlakes(g, ox, oy); break;
+      case "sleet_showers":   iconCloud(g, ox+20, oy+18, 1.1, "var(--tft-clouddark)"); iconRainDrops(g, ox-6, oy); iconSnowFlakes(g, ox+6, oy); break;
+      case "hail":            iconCloud(g, ox+20, oy+18, 1.1, "var(--tft-clouddark)"); iconHail(g, ox, oy); break;
+      case "storm":           iconCloud(g, ox+20, oy+17, 1.1, "var(--tft-clouddark)"); iconBolt(g, ox, oy-4); break;
+      case "storm_snow":      iconCloud(g, ox+20, oy+17, 1.1, "var(--tft-clouddark)"); iconBolt(g, ox-4, oy-4); iconSnowFlakes(g, ox+8, oy+2); break;
+    }
+  }
+  function windIconLines(g, n, color){
+    var ox = 440;
+    var lens = [14, 20, 26];
+    var ys = [14, 20, 26];
+    for (var i = 0; i < n; i++){
+      var y = ys[i];
+      g.appendChild(svgEl("line", {x1:ox+7, y1:y, x2:ox+7+lens[i], y2:y, stroke:color, "stroke-width":2.4, "stroke-linecap":"round"}));
+    }
+  }
+  function updateCornerWindIcon(){
+    var g = document.getElementById("cornerWind");
+    while (g.firstChild) g.removeChild(g.firstChild);
+    var mw = (lastExtra2 && typeof lastExtra2.mw === "number") ? lastExtra2.mw : -1;
+    var threshold = (lastStatus2 && typeof lastStatus2.wM === "number") ? lastStatus2.wM : 0;
+    var windAlert = (mw >= 0) && (threshold > 0) && (mw > threshold);
+    var n, color;
+    if (windAlert){
+      n = 3;
+      color = blinkOn ? "var(--tft-red)" : "var(--tft-fg)";
+    } else if (mw < 0){
+      n = 3; color = "var(--tft-fg)";
+    } else if (mw < 1.0){
+      n = 1; color = "var(--tft-darkgrey)";
+    } else if (mw < 15.0){
+      n = 2; color = "var(--tft-fg)";
+    } else {
+      n = 3; color = "var(--tft-orange)";
+    }
+    windIconLines(g, n, color);
+  }
+
+  // ---- Bandeau superieur : 5 onglets (DrawModeRunTopTabs) ----
+  var TOP_TABS = [
+    {key:"lE", label:"LDR E", unit:""},
+    {key:"lO", label:"LDR O", unit:""},
+    {key:"lH", label:"LDR H", unit:""},
+    {key:"lB", label:"LDR B", unit:""},
+    {key:"wd", label:"Vent",  unit:" km/h"}
+  ];
+  function buildTopTabs(){
+    var g = document.getElementById("topTabs");
+    TOP_TABS.forEach(function(t, i){
+      var x = 40 + i*80, y = 0, w = 78, h = 40;
+      g.appendChild(svgEl("rect", {x:x, y:y, width:w, height:h, rx:4, fill:"var(--tft-tabbg)", id:"tab_" + t.key}));
+      var lbl = svgEl("text", {x:x+4, y:y+9, class:"svgTxt", "font-size":6, fill:"#1a2a3a"});
+      lbl.textContent = t.label;
+      g.appendChild(lbl);
+      var val = svgEl("text", {x:x+4, y:y+22, class:"svgTxt", "font-size":9, "font-weight":700, fill:"#1a2a3a", id:"tabval_" + t.key});
+      val.textContent = "--";
+      g.appendChild(val);
+      g.appendChild(svgEl("rect", {x:x+6, y:y+34, width:68, height:6, rx:2, fill:"none", stroke:"var(--tft-darkgrey)", "stroke-width":0.5}));
+      g.appendChild(svgEl("rect", {x:x+6, y:y+34, width:0, height:6, rx:2, fill:"var(--tft-green)", id:"tabbar_" + t.key}));
+    });
+  }
+
+  // AJOUT (session, GO : "il faut se mettre a la place d'un user lambda et
+  // le guider... donc TOUT le menu, TOUT les appuis affiche une aide
+  // PARTOUT") - port EXACT depuis tracker_dashboard.html (memes textes,
+  // memes gardes verifiees contre ProcessRemoteMqttCommand() du .ino) -
+  // sans les entrees "rec"/"lever" (retirees, cf. RIGHT_ITEMS plus bas) ni
+  // "srcLDR/SEC/CRB" (picker Auto absent de cette page, cf. commentaire
+  // d'entete : la zone centrale Auto a ete volontairement retiree ici).
+  var HELP_TEXT = {
+    auto:    {title:"AUTO", text:"Bascule le tracker en mode Automatique et renvoie vers le tableau de bord classique (tracker_dashboard.html), qui affiche la zone Auto (previsions, choix de la source LDR/Secours/Courbe) - cette page-ci n'affiche que la zone Manuelle."},
+    manu:    {title:"MANU", text:"Bascule le tracker en mode Manuel : les deux moteurs sont arretes immediatement. Tu pilotes ensuite le panneau toi-meme avec les 4 fleches, ou tu utilises ARRET D'URGENCE pour tout stopper."},
+    axe:     {title:"AXE", text:"Change le mode d'axe : simple axe (azimut seul) ou double axe (azimut + inclinaison). S'applique aussi bien au suivi Automatique qu'au pilotage Manuel."},
+    razaz:   {title:"RAZ AZ", text:"Marque la position actuelle de l'axe azimut comme le zero (limite Est). A n'utiliser QUE quand le panneau est physiquement pres de sa butee Est - sinon la commande est refusee et rien n'est enregistre. 1er appui = armer, 2e appui (dans les 10s) = confirmer et enregistrer. Necessite le jeton distant (Admin) si aucune session locale n'est active sur le tracker."},
+    raztilt: {title:"RAZ TILT", text:"Marque la position actuelle de l'axe inclinaison comme le zero (vertical). A n'utiliser QUE quand le panneau est physiquement pres de la verticale - sinon la commande est refusee et rien n'est enregistre. 1er appui = armer, 2e appui (dans les 10s) = confirmer et enregistrer. Necessite le jeton distant (Admin) si aucune session locale n'est active sur le tracker."},
+    secu:    {title:"SECU", text:"Active/desactive le mode replis automatique (protection vent) : si actif, le tracker se met en position de repli des que le seuil de vent est depasse. Reglage de securite important, accessible ici en plus du menu Admin local. Necessite le jeton distant (Admin) si aucune session locale n'est active sur le tracker."},
+    nuit:    {title:"NUIT", text:"Recalibre le seuil de detection de la nuit a partir de la luminosite actuelle des capteurs LDR Est/Ouest - a utiliser au moment precis ou tu juges qu'il fait nuit (ou jour), pour coller ce seuil a la vraie luminosite du moment. 1er appui = armer, 2e appui (dans les 10s) = confirmer."},
+    exit:    {title:"EXIT", text:"Retour visuel local uniquement : ce bouton n'envoie aucune commande au tracker. Il correspond a la sortie d'un sous-ecran sur l'ecran physique."},
+    estop:   {title:"ARRET D'URGENCE", text:"Coupe les deux moteurs immediatement et repasse le tracker en mode Manuel - prioritaire sur tout, meme en alarme vent. 1er appui = armer (evite un appui accidentel), 2e appui (dans les 10s) = confirmer et couper. Le deverrouillage se fait uniquement en local sur le tracker, Admin > Moteur."},
+    jog_up:    {title:"FLECHE HAUT", text:"Maintiens appuye pour incliner le panneau vers le haut. Fonctionne uniquement en mode Manuel, et seulement si l'arret d'urgence n'est pas verrouille et sans alarme vent en cours. Relache pour arreter le moteur."},
+    jog_down:  {title:"FLECHE BAS", text:"Maintiens appuye pour incliner le panneau vers le bas. Fonctionne uniquement en mode Manuel, et seulement si l'arret d'urgence n'est pas verrouille et sans alarme vent en cours. Relache pour arreter le moteur."},
+    jog_west:  {title:"FLECHE OUEST", text:"Maintiens appuye pour tourner le panneau vers l'Ouest (azimut). Fonctionne uniquement en mode Manuel, et seulement si l'arret d'urgence n'est pas verrouille et sans alarme vent en cours. Relache pour arreter le moteur."},
+    jog_east:  {title:"FLECHE EST", text:"Maintiens appuye pour tourner le panneau vers l'Est (azimut). Fonctionne uniquement en mode Manuel, et seulement si l'arret d'urgence n'est pas verrouille et sans alarme vent en cours. Relache pour arreter le moteur."},
+    ldr_E:   {title:"LDR E -10/+10", text:"Ajuste de 10 l'offset de calibration du capteur LDR Est. Sert a corriger un capteur legerement plus ou moins sensible que les autres, sans toucher au seuil de nuit lui-meme (cf. bouton NUIT)."},
+    ldr_O:   {title:"LDR O -10/+10", text:"Ajuste de 10 l'offset de calibration du capteur LDR Ouest. Sert a corriger un capteur legerement plus ou moins sensible que les autres, sans toucher au seuil de nuit lui-meme (cf. bouton NUIT)."},
+    ldr_H:   {title:"LDR H -10/+10", text:"Ajuste de 10 l'offset de calibration du capteur LDR Haut. Sert a corriger un capteur legerement plus ou moins sensible que les autres, sans toucher au seuil de nuit lui-meme (cf. bouton NUIT)."},
+    ldr_B:   {title:"LDR B -10/+10", text:"Ajuste de 10 l'offset de calibration du capteur LDR Bas. Sert a corriger un capteur legerement plus ou moins sensible que les autres, sans toucher au seuil de nuit lui-meme (cf. bouton NUIT)."}
+  };
+  var dashHelpEnabled = true;   // reflete HelpTextEnabled cote .ino (champ "ht", cf. renderExtra()) - defaut true = meme valeur par defaut que le firmware
+  function showHelp(key){
+    if (!dashHelpEnabled) return;
+    var h = HELP_TEXT[key];
+    if (!h) return;
+    document.getElementById("dashHelpTitle").textContent = h.title;
+    document.getElementById("dashHelpText").textContent = h.text;
+  }
+  function setHelpEnabled(v){
+    dashHelpEnabled = v;
+    document.getElementById("dashHelpBox").classList.toggle("hidden", !v);
+  }
+
+  // ---- Colonnes gauche/droite (DrawModeRunLeftColumn/DrawModeRunRightColumn) ----
+  // CORRECTIF SECURITE (session, GO : "et si tu vois des trous fouille",
+  // meme correctif deja applique cote tracker_dashboard.html) - razaz/
+  // raztilt/nuit avaient cmd renseigne ICI *ET* etaient cablees via
+  // makeArmConfirmColumn() plus bas - double listener sur le meme bouton
+  // (buildColumn() ET makeArmConfirmColumn() ciblent le MEME element
+  // "col_<key>"), donc CHAQUE tap envoyait la commande 2 fois d'affilee.
+  // cmd desormais a null ici (comme exit) : SEUL makeArmConfirmColumn()
+  // publie, une fois par tap.
+  var LEFT_ITEMS  = [
+    {key:"auto", label:"AUTO", cmd:{cmd:"auto"}},
+    {key:"manu", label:"MANU", cmd:{cmd:"manu"}},
+    // CORRECTIF (session, GO : "1 ax onglet doit devenir rouge") - cmd:null
+    // desormais : VERIFIE (pas suppose) que le click handler generique
+    // ci-dessous (buildColumn()) ne traite QUE it.key==="manu" - "axe" avec
+    // un cmd non-null tombait donc dans le listener sans JAMAIS rien
+    // envoyer (bouton mort). Cablage dedie via makeArmConfirmColumn() plus
+    // bas (session, GO "oui fait le correctif" - meme cablage EXACT que
+    // razaz/raztilt/nuit desormais que le firmware a son propre etat
+    // RemoteAxisArmed, cf. commentaire complet pres de son appel).
+    {key:"axe",  label:"AXE",  cmd:null},
+    {key:"razaz",label:"RAZ AZ", cmd:null},
+    {key:"raztilt",label:"RAZ TILT", cmd:null}
+  ];
+  // RETRAIT REC/LEVER (session, GO : "retirer les 2 boutons du dashboard" -
+  // meme decision que tracker_dashboard.html : ni cmd=="rec" ni cmd=="lever"
+  // n'existent dans ProcessRemoteMqttCommand() du .ino, verifie).
+  // CORRECTIF POSITION (session, GO : "je veux le meme ecran ... au pixel
+  // pres") - meme correctif EXACT que tracker_dashboard.html (cf. son
+  // propre commentaire) : 2 "trous" (null) reintroduits pour que NUIT/EXIT
+  // retombent sur leurs VRAIES coordonnees y=122/202 (DrawModeRunRightColumn(),
+  // fichier05), au lieu d'etre remontees/compactees a y=82/122.
+  var RIGHT_ITEMS = [
+    {key:"secu",  label:"SECU",  cmd:{cmd:"repli"}},
+    null,   // REC (WSC_TAB_FALLBACK) - emplacement vide, cf. commentaire ci-dessus
+    {key:"nuit",  label:"NUIT",  cmd:null},
+    null,   // LEVER (WSC_TAB_LEVER) - emplacement vide, cf. commentaire ci-dessus
+    {key:"exit",  label:"EXIT",  cmd:null}
+  ];
+  function buildColumn(containerId, items, x){
+    var g = document.getElementById(containerId);
+    items.forEach(function(it, i){
+      // CORRECTIF (session, GO) - un "trou" (null) ne dessine rien a cet
+      // index mais laisse passer l'index i, cf. commentaire de
+      // RIGHT_ITEMS ci-dessus.
+      if (!it) return;
+      var y = 42 + 40*i, w = 40, h = 39;
+      var grp = svgEl("g", {class:"colBtn", id: "col_" + it.key});
+      grp.appendChild(svgEl("rect", {x:x, y:y, width:w, height:h, rx:6, fill:"var(--tft-darkgrey)", id:"colrect_" + it.key}));
+      var txt = svgEl("text", {x:x+w/2, y:y+h/2+3, "text-anchor":"middle", class:"svgTxt", "font-size":6.5, "font-weight":700, id:"coltxt_" + it.key});
+      it.label.split(" ").forEach(function(word, wi){
+        var tspan = document.createElementNS(SVGNS, "tspan");
+        tspan.setAttribute("x", x+w/2);
+        tspan.setAttribute("dy", wi === 0 ? (it.label.indexOf(" ")>0 ? -4 : 0) : 8);
+        tspan.textContent = word;
+        txt.appendChild(tspan);
+      });
+      grp.appendChild(txt);
+      if (it.cmd) grp.addEventListener("click", function(){
+        if (it.key === "manu") { publishCmd(it.cmd); setDisplayedTab("MANU"); return; }
+        if (it.key === "auto") {
+          // CORRECTIF (session, GO : "quand je passe le dashboard de auto a
+          // manu le tracker doit passer en manu alors que la il reste en
+          // auto [...] CEST UNE QUESTION DE SECURITE") - cette page n'a PAS
+          // de rendu Auto (retire volontairement, cf. commentaire d'entete) :
+          // le passage en Auto renvoie donc forcement vers
+          // tracker_dashboard.html (identifiants MQTT deja saisis reportes
+          // dans l'URL). Avant : setTimeout fixe de 200ms devine, sur un
+          // publish QoS 0 (fire-and-forget) - rien ne garantissait que la
+          // commande soit reellement partie avant que la navigation ne coupe
+          // le WebSocket. Desormais : on attend l'accuse de reception du
+          // broker (QoS 1, cf. publishCmd()) avant de naviguer, avec un
+          // filet de securite (MAX_NAV_WAIT_MS) pour ne pas bloquer l'user
+          // indefiniment si l'accuse tarde/n'arrive jamais (ex. coupure
+          // reseau au mauvais moment) - dans ce cas on navigue quand meme,
+          // au pire avec le meme risque qu'avant, jamais pire.
+          var navigated = false;
+          var MAX_NAV_WAIT_MS = 1500;
+          function goToAuto(){
+            if (navigated) return;
+            navigated = true;
+            setDisplayedTab("AUTO");
+            var url = crossPageUrl("tracker_dashboard.html");
+            if (url) window.location.href = url;
+          }
+          publishCmd(it.cmd, function(ok){ goToAuto(); });
+          setTimeout(goToAuto, MAX_NAV_WAIT_MS);
+        }
+      });
+      if (it.key === "exit") grp.addEventListener("click", function(){ /* pas de commande distante d'origine - simple retour visuel local */ });
+      // AJOUT (session, GO : "aide et fonction") - port EXACT depuis
+      // tracker_dashboard.html : affiche l'aide contextuelle au survol/tap,
+      // INDEPENDAMMENT du clic qui envoie la commande.
+      grp.addEventListener("mouseenter", function(){ showHelp(it.key); });
+      grp.addEventListener("touchstart", function(){ showHelp(it.key); }, {passive:true});
+      g.appendChild(grp);
+    });
+  }
+
+  function setDisplayedTab(tab){
+    wsDisplayedTab = tab;
+    updateColumnHighlight();
+  }
+  // CORRECTIF COULEUR (session, GO : "L'ENSEMBLE des couleurs ... aux
+  // pixel pres") - port EXACT depuis tracker_dashboard.html (cf. son
+  // propre commentaire pour le detail complet) : la case AUTO n'est PAS un
+  // simple highlight rouge comme MANU, elle est ST7796S_DARKGREEN (suivi
+  // normal) ou THEME_ERROR/rouge fixe (bascule Auto->Secours silencieuse,
+  // "ab") quand elle est reellement engagee.
+  function updateAutoColumnColor(){
+    var rect = document.getElementById("colrect_auto");
+    var txt  = document.getElementById("coltxt_auto");
+    if (!rect) return;
+    if (wsDisplayedTab !== "AUTO") {
+      rect.setAttribute("fill", "var(--tft-darkgrey)");
+      if (txt) txt.setAttribute("fill", "var(--tft-fg)");
+      return;
+    }
+    var basculed = !!(lastExtra2 && lastExtra2.ab);
+    rect.setAttribute("fill", basculed ? "var(--tft-red)" : "var(--tft-darkgreen)");
+    if (txt) txt.setAttribute("fill", "var(--tft-selecttext)");
+  }
+  function updateColumnHighlight(){
+    updateAutoColumnColor();
+    document.getElementById("colrect_manu").setAttribute("fill", wsDisplayedTab === "MANU" ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    document.getElementById("coltxt_manu").setAttribute("fill", wsDisplayedTab === "MANU" ? "var(--tft-selecttext)" : "var(--tft-fg)");
+  }
+
+  // AJOUT (session, GO : "il faut remonter le gros rectangle rouge 'do not
+  // touch'.. et bloquer le dashboard le temps du compte a rebourt!") - port
+  // EXACT depuis tracker_dashboard.html (meme fonction, cf. son propre
+  // commentaire).
+  var windAlarmActive = false;
+  var windAlarmRemainSec = 0;
+  var windAlarmTicker = null;
+  function formatWindAlarmCountdown(sec){
+    if (sec < 0) sec = 0;
+    var mm = Math.floor(sec / 60), ss = sec % 60;
+    return "Retour dans : " + (mm < 10 ? "0" + mm : mm) + ":" + (ss < 10 ? "0" + ss : ss) + " mn";
+  }
+  function setWindAlarm(active, remainSec){
+    windAlarmActive = active;
+    if (typeof remainSec === "number") windAlarmRemainSec = remainSec;
+    document.getElementById("windAlarmOverlay").style.display = active ? "" : "none";
+    document.getElementById("windAlarmCountdown").textContent = formatWindAlarmCountdown(windAlarmRemainSec);
+    document.getElementById("leftCol").classList.toggle("wsBlocked", active);
+    document.getElementById("rightCol").classList.toggle("wsBlocked", active);
+    if (active && !windAlarmTicker) {
+      windAlarmTicker = setInterval(function(){
+        windAlarmRemainSec = Math.max(0, windAlarmRemainSec - 1);
+        document.getElementById("windAlarmCountdown").textContent = formatWindAlarmCountdown(windAlarmRemainSec);
+      }, 1000);
+    } else if (!active && windAlarmTicker) {
+      clearInterval(windAlarmTicker);
+      windAlarmTicker = null;
+    }
+  }
+
+  // AJOUT (session, GO : "je t'envoie les html a mettre a jour...") - port
+  // EXACT depuis tracker_dashboard.html.
+  function setHsBadge(v){
+    document.getElementById("hsBadge").style.display = v ? "" : "none";
+  }
+
+  // ---- Zone centrale Manu : jauges AS5600 (DrawAs5600Gauges/DrawAs5600Gauge) ----
+  function buildGauge(containerId, cx, cy, r, label){
+    var g = document.getElementById(containerId);
+    g.appendChild(svgEl("circle", {cx:cx, cy:cy, r:r, fill:"var(--tft-bg)"}));
+    var ticksG = svgEl("g", {id: containerId + "_ticks"});
+    for (var i = 0; i < 24; i++){
+      var ang = (i * 15 - 90) * Math.PI / 180; // 0 deg = 12h, sens horaire
+      var x1 = cx + (r-8) * Math.cos(ang), y1 = cy + (r-8) * Math.sin(ang);
+      var x2 = cx + r * Math.cos(ang), y2 = cy + r * Math.sin(ang);
+      ticksG.appendChild(svgEl("line", {x1:x1, y1:y1, x2:x2, y2:y2, stroke:"var(--tft-darkgrey)", "stroke-width":2, id: containerId + "_tick" + i}));
+    }
+    g.appendChild(ticksG);
+    g.appendChild(svgEl("circle", {cx:cx, cy:cy, r:r, fill:"none", stroke:"var(--tft-darkgrey)", "stroke-width":1.5, id: containerId + "_ring"}));
+    var val = svgEl("text", {x:cx, y:cy-6, "text-anchor":"middle", class:"svgTxt", "font-size":13, "font-weight":700, id: containerId + "_val"});
+    val.textContent = "--";
+    g.appendChild(val);
+    var lbl = svgEl("text", {x:cx, y:cy+14, "text-anchor":"middle", class:"svgTxt", "font-size":7, id: containerId + "_lbl"});
+    lbl.textContent = label;
+    g.appendChild(lbl);
+  }
+  function gaugeColor(pct){
+    if (pct < 0.40) return "var(--tft-green)";
+    if (pct < 0.80) return "var(--tft-yellow)";
+    return "var(--tft-red)";
+  }
+  function updateGauge(containerId, valueDeg, maxDeg){
+    var pct = Math.max(0, Math.min(1, valueDeg / maxDeg));
+    var col = gaugeColor(pct);
+    var lit = Math.round(pct * 24);
+    for (var i = 0; i < 24; i++){
+      document.getElementById(containerId + "_tick" + i).setAttribute("stroke", i < lit ? col : "var(--tft-darkgrey)");
+    }
+    document.getElementById(containerId + "_ring").setAttribute("stroke", col);
+    document.getElementById(containerId + "_val").setAttribute("fill", col);
+    document.getElementById(containerId + "_val").textContent = Math.round(valueDeg) + "°";
+    document.getElementById(containerId + "_lbl").setAttribute("fill", col);
+  }
+
+  // ---- Init ----
+  buildTopTabs();
+  buildColumn("leftCol", LEFT_ITEMS, 0);
+  buildColumn("rightCol", RIGHT_ITEMS, 440);
+  buildGauge("gaugeAz",    105, 96, 40, "AZ");
+  buildGauge("gaugeTilt",  375, 96, 40, "TILT");
+  setDisplayedTab("MANU");
+
+  // AJOUT (session, GO code : "meme interface que le ino couleurs position
+  // texte EFFET etc") - clignotement reproduit fidelement (400ms, meme
+  // cadence que CheckArmTimeout()/DrawForecastRecStatus()/etc. cote .ino)
+  // au lieu des couleurs fixes de la version precedente. Un seul ticker
+  // partage (blinkOn) + un etat "arme" par bouton a 2 temps, mêmes noms de
+  // variables Armed que le firmware (RazAzArmed/RazTiltArmed/NuitArmed/
+  // EstopArmed - ici purement visuel cote navigateur, le firmware garde
+  // son propre arme/confirme server-side independant, cf. commentaire
+  // PublishMqttAutoExtra()/ProcessRemoteMqttCommand() dans le .ino).
+  var lastStatus2 = null, lastExtra2 = null;
+  var calibMissing = false;
+  var razAzArmed = false, razTiltArmed = false, nuitArmed = false, estopArmed = false;
+  // AJOUT (session, GO : "1 ax onglet doit devenir rouge... verifie aussi
+  // pour les autres onglets") - reflet visuel de l'armement de l'axe.
+  // CORRECTIF (session, GO : "oui fait le correctif" - suite a l'ajout de
+  // RemoteAxisArmed cote firmware) : axisArmed est desormais synchronise par
+  // makeArmConfirmColumn("axe", "axis", ...) plus bas, EXACTEMENT comme
+  // razAzArmed/razTiltArmed/nuitArmed - meme correctif EXACT que
+  // tracker_dashboard.html. axisArmedTimer (minuteur dedie a l'ancienne
+  // implementation) supprime : makeArmConfirmColumn gere son propre timeout
+  // en interne.
+  var axisArmed = false;
+  var blinkOn = false;
+
+  function applyBlinkEffects(){
+    // Calibrage manquant : priorite absolue, toute la colonne gauche clignote rouge
+    if (calibMissing) {
+      var col = blinkOn ? "var(--tft-red)" : "var(--tft-darkgrey)";
+      ["auto","manu","axe","razaz","raztilt"].forEach(function(k){
+        document.getElementById("colrect_" + k).setAttribute("fill", col);
+      });
+    }
+    // CORRECTIF COULEUR (session, GO : "verifie aussi pour les autres
+    // onglets") - meme correctif EXACT que tracker_dashboard.html (cf. son
+    // propre commentaire pour le detail) : RAZ AZ/RAZ TILT/NUIT armes
+    // clignotent en rouge (THEME_SELECT), pas en orange (THEME_HIGHLIGHT).
+    if (razAzArmed)   document.getElementById("colrect_razaz").setAttribute("fill", blinkOn ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    if (razTiltArmed) document.getElementById("colrect_raztilt").setAttribute("fill", blinkOn ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    if (nuitArmed)     document.getElementById("colrect_nuit").setAttribute("fill", blinkOn ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    // AJOUT (session, GO : "1 ax onglet doit devenir rouge") - meme
+    // correctif EXACT que tracker_dashboard.html (cf. son propre commentaire
+    // pour le detail).
+    var axisHighlight = axisArmed || (lastStatus2 && lastStatus2.ax === "simple");
+    document.getElementById("colrect_axe").setAttribute("fill", axisHighlight ? (blinkOn ? "var(--tft-select)" : "var(--tft-darkgrey)") : "var(--tft-darkgrey)");
+    // STOP arme : texte + fond clignotent rouge/blanc (meme principe que EstopArmed/DrawManualJogControls)
+    if (estopArmed) {
+      document.getElementById("btnEstopSvg").setAttribute("fill", blinkOn ? "var(--tft-red)" : "#ffffff");
+      document.getElementById("estopTxt1").setAttribute("fill", blinkOn ? "#ffffff" : "var(--tft-red)");
+      document.getElementById("estopTxt2").setAttribute("fill", blinkOn ? "#ffffff" : "var(--tft-red)");
+    }
+    if (lastStatus2) {
+      var d = lastStatus2;
+      // Onglets LDR : clignotent rouge en mode degrade (fb=FallbackEnabled)
+      ["lE","lO","lH","lB"].forEach(function(k){
+        document.getElementById("tab_" + k).setAttribute("fill", d.fb ? (blinkOn ? "var(--tft-red)" : "var(--tft-tabbg)") : "var(--tft-tabbg)");
+      });
+      // AJOUT COULEUR (session, GO : "L'ENSEMBLE des couleurs ... aux
+      // pixel pres") - meme correctif EXACT que tracker_dashboard.html
+      // (cf. son propre commentaire pour le detail) : onglet Vent absent
+      // de tout clignotement jusqu'ici.
+      var windBlink = (d.wM === 0 || !d.rp) && blinkOn;
+      document.getElementById("tab_wd").setAttribute("fill", windBlink ? "var(--tft-select)" : "var(--tft-tabbg)");
+    }
+    // AJOUT (session, GO "ajoute les icons de coin... meteo concept") - meme
+    // correctif EXACT que tracker_dashboard.html (cf. son propre commentaire).
+    if (lastExtra2) updateCornerWindIcon();
+  }
+  setInterval(function(){ blinkOn = !blinkOn; applyBlinkEffects(); }, 400);
+
+  // ---- Rendu message frequent (az/ti/md/sf/nt/ax/es/lE/lO/lH/lB/wd/wM/bt/fb/rp/aM/tM) ----
+  function renderStatus(d){
+    lastStatus2 = d;
+    // AJOUT (session, GO : "si la vue dashboard est auto alors c'est la
+    // meme vue a afficher en mode run") - port EXACT du meme principe que
+    // tracker_dashboard.html : wsDisplayedTab suit le mode REEL (d.md), pas
+    // seulement un clic local, pour que la colonne gauche ne reste jamais
+    // figee sur un etat perime.
+    setDisplayedTab(d.md === "AUTO" ? "AUTO" : "MANU");
+    // AJOUT (session, GO : "safety vent... ne remonte pas dans le
+    // dashboard") - port EXACT depuis tracker_dashboard.html : "sf"/"wa"
+    // etaient deja envoyes mais jamais lus ici.
+    setWindAlarm(d.sf === "ALARME", d.wa);
+    document.getElementById("tabval_lE").textContent = d.lE;
+    document.getElementById("tabval_lO").textContent = d.lO;
+    document.getElementById("tabval_lH").textContent = d.lH;
+    document.getElementById("tabval_lB").textContent = d.lB;
+    document.getElementById("tabval_wd").textContent = d.wd.toFixed(1);
+    ["lE","lO","lH","lB"].forEach(function(k){
+      var v = d[k];
+      var pct = Math.max(0, Math.min(1, v / 32767));
+      var bar = document.getElementById("tabbar_" + k);
+      bar.setAttribute("width", 68 * pct);
+      bar.setAttribute("fill", pct < 0.40 ? "var(--tft-green)" : (pct < 0.80 ? "var(--tft-yellow)" : "var(--tft-red)"));
+    });
+    // CORRECTIF COULEUR (session, GO : "L'ENSEMBLE des couleurs ... aux
+    // pixel pres") - meme correctif EXACT que tracker_dashboard.html :
+    // drawMiniBar() (fichier04) applique TOUJOURS les seuils 40%/80% pour
+    // TOUTES les jauges (LDR et Vent confondus, meme fonction), jamais
+    // 70%/100%.
+    var windPct = d.wM > 0 ? Math.min(1, d.wd / d.wM) : 0;
+    var windBar = document.getElementById("tabbar_wd");
+    windBar.setAttribute("width", 68 * windPct);
+    windBar.setAttribute("fill", windPct < 0.40 ? "var(--tft-green)" : (windPct < 0.80 ? "var(--tft-yellow)" : "var(--tft-red)"));
+
+    // Colonne gauche : AUTO/MANU fixe "on" selon mode courant (pas de
+    // clignotement, cf. .ino) ; AXE affiche 1AX/2AX. SIMPLIFIE (session,
+    // meme raison EXACTE que tracker_dashboard.html) : wsDisplayedTab vaut
+    // TOUJOURS d.md a ce stade (setDisplayedTab() deja appelee en tete de
+    // fonction).
+    if (!calibMissing) {
+      // CORRECTIF (session, GO : "L'ENSEMBLE des couleurs ... aux pixel
+      // pres") - colrect_auto n'est plus fixe ici en dur : setDisplayedTab()
+      // (tete de fonction) a deja appele updateColumnHighlight()
+      // ->updateAutoColumnColor(), seule source de verite desormais
+      // (vert-fonce/rouge bascule, cf. sa declaration) - le re-ecrire ici
+      // en "select" l'aurait aussitot ecrase.
+      document.getElementById("colrect_manu").setAttribute("fill", (d.md === "MANUEL") ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    }
+    var axeTxt = document.getElementById("coltxt_axe");
+    axeTxt.textContent = "";
+    var axeSpan = document.createElementNS(SVGNS, "tspan");
+    axeSpan.setAttribute("x", 20); axeSpan.setAttribute("dy", 0);
+    axeSpan.textContent = (d.ax === "double") ? "2AX" : "1AX";
+    axeTxt.appendChild(axeSpan);
+
+    // Colonne droite : SECU (repli), NUIT, indicateurs simples (fond select si actif, pas de clignotement propre ici)
+    document.getElementById("colrect_secu").setAttribute("fill", d.rp ? "var(--tft-select)" : "var(--tft-darkgrey)");
+    if (!nuitArmed) document.getElementById("colrect_nuit").setAttribute("fill", d.nt ? "var(--tft-select)" : "var(--tft-darkgrey)");
+
+    // Jauges AS5600 (onglet Manu)
+    updateGauge("gaugeAz",   d.az, 180);
+    updateGauge("gaugeTilt", d.ti, 90);
+
+    // STOP : verrouille = maroon fixe, libre = rouge normal (sauf pendant armement, gere par applyBlinkEffects)
+    if (!estopArmed) document.getElementById("btnEstopSvg").setAttribute("fill", d.es ? "var(--tft-maroon)" : "var(--tft-red)");
+
+    applyBlinkEffects();
+  }
+
+  // ---- Rendu message peu frequent ("t":"ex" - PublishMqttAutoExtra()) ----
+  function renderExtra(d){
+    lastExtra2 = d;
+    // AJOUT (session, GO : "oui il faut que le switch admin sur l'aide
+    // pilote egalement le dashboard") - port EXACT depuis
+    // tracker_dashboard.html.
+    if (typeof d.ht === "boolean") setHelpEnabled(d.ht);
+
+    // Calibrage manquant = TOUTE la colonne gauche clignote rouge sur le vrai ecran (calibMissingBlink, priorite absolue) - cf. applyBlinkEffects()
+    calibMissing = !(d.aC && d.tC);
+    if (!calibMissing) {
+      // CORRECTIF (session, GO : "L'ENSEMBLE des couleurs ... aux pixel
+      // pres") - "auto" retire de ce reset, meme raisonnement EXACT que
+      // tracker_dashboard.html (cf. son propre commentaire) :
+      // updateAutoColumnColor() (appelee juste en dessous) est desormais
+      // la SEULE source de verite pour cette case.
+      ["manu","axe","razaz","raztilt"].forEach(function(k){
+        if (k !== "razaz" || !razAzArmed) if (k !== "raztilt" || !razTiltArmed)
+          document.getElementById("colrect_" + k).setAttribute("fill", "var(--tft-darkgrey)");
+      });
+    }
+    // AJOUT (session, GO) - "ab" vient d'arriver avec ce message "ex" :
+    // repeint la case AUTO immediatement.
+    updateAutoColumnColor();
+
+    document.getElementById("vNightThreshold").textContent = d.nT;
+    document.getElementById("vOffE").textContent = d.oE;
+    document.getElementById("vOffO").textContent = d.oO;
+    document.getElementById("vOffH").textContent = d.oH;
+    document.getElementById("vOffB").textContent = d.oB;
+
+    // AJOUT (session, GO : "je t'envoie les html a mettre a jour...") -
+    // "hs" (alarme HS locale), meme champ EXACT que tracker_dashboard.html.
+    // "sm" (source Auto LDR/SEC/CRB) volontairement PAS lu ici : cette page
+    // n'a pas de zone Auto/picker, cf. commentaire d'entete du fichier.
+    if (typeof d.hs === "boolean") setHsBadge(d.hs);
+
+    // AJOUT (session, GO "ajoute les icons de coin... meteo concept") -
+    // meme correctif EXACT que tracker_dashboard.html (cf. son propre
+    // commentaire) : icones de coin presentes/mises a jour quel que soit
+    // l'onglet affiche (cette page est dediee Manu, mais les icones de coin
+    // sont visibles en permanence sur le vrai tracker, Auto comme Manu).
+    // CORRECTIF (session, GO code, "je devrais avoir le choix") : "wp"/"wi"
+    // desormais passes a updateCornerWeatherIcon(), meme correctif EXACT que
+    // tracker_dashboard.html.
+    if (typeof d.mc === "number") updateCornerWeatherIcon(d.wp, d.mc, d.wi);
+    if (typeof d.mw === "number") updateCornerWindIcon();
+  }
+
+  setInterval(function(){
+    var el = document.getElementById("vLastSeen");
+    if (!lastSeenMs) { el.textContent = "--"; return; }
+    var s = Math.round((Date.now() - lastSeenMs) / 1000);
+    el.textContent = s + " s";
+    el.style.color = s > 15 ? "var(--crit)" : "var(--text-muted)";
+  }, 1000);
+
+  // ---- Commandes ----
+  document.getElementById("btnConnect").addEventListener("click", connect);
+
+  // STOP : cycle armer/confirmer 2 taps, meme principe que EstopArmed cote
+  // .ino (DrawManualJogControls, texte clignotant) au lieu du popup
+  // confirm() de la version precedente.
+  document.getElementById("btnEstopSvg").addEventListener("click", function(){
+    if (estopArmed) {
+      publishCmd({cmd:"estop"});
+      estopArmed = false;
+      document.getElementById("estopTxt1").textContent = "ARRET";
+      document.getElementById("estopTxt2").textContent = "D'URGENCE";
+      document.getElementById("estopTxt1").setAttribute("fill", "#ffffff");
+      document.getElementById("estopTxt2").setAttribute("fill", "#ffffff");
+      document.getElementById("btnEstopSvg").setAttribute("fill", "var(--tft-red)");
+    } else {
+      estopArmed = true;
+      document.getElementById("estopTxt1").textContent = "CONFIRMER";
+      document.getElementById("estopTxt2").textContent = "L'ARRET ?";
+      setTimeout(function(){
+        if (!estopArmed) return;
+        estopArmed = false;
+        document.getElementById("estopTxt1").textContent = "ARRET";
+        document.getElementById("estopTxt2").textContent = "D'URGENCE";
+        document.getElementById("btnEstopSvg").setAttribute("fill", "var(--tft-red)");
+      }, 10000);
+    }
+  });
+  // AJOUT (session, GO : "aide et fonction") - port EXACT depuis
+  // tracker_dashboard.html.
+  document.getElementById("btnEstopSvg").addEventListener("mouseenter", function(){ showHelp("estop"); });
+  document.getElementById("btnEstopSvg").addEventListener("touchstart", function(){ showHelp("estop"); }, {passive:true});
+
+  // RAZ AZ/TILT/NUIT : cycle armer/confirmer - meme discipline "2 clics" et
+  // meme clignotement (applyBlinkEffects()) que l'ecran Mode Run local.
+  function makeArmConfirmColumn(key, cmd, armedSetter){
+    var el = document.getElementById("col_" + key);
+    var rect = document.getElementById("colrect_" + key);
+    var armed = false, timer = null;
+    el.addEventListener("click", function(){
+      publishCmd({cmd:cmd});
+      armed = !armed;
+      armedSetter(armed);
+      if (!armed) rect.setAttribute("fill", "var(--tft-darkgrey)");
+      if (timer) clearTimeout(timer);
+      if (armed) timer = setTimeout(function(){ armed = false; armedSetter(false); rect.setAttribute("fill", "var(--tft-darkgrey)"); }, 10000);
+    });
+  }
+  makeArmConfirmColumn("razaz",   "raz_az",   function(v){ razAzArmed = v; });
+  makeArmConfirmColumn("raztilt", "raz_tilt", function(v){ razTiltArmed = v; });
+  makeArmConfirmColumn("nuit",    "nuit",     function(v){ nuitArmed = v; });
+  // AXE (session, GO : "1 ax onglet doit devenir rouge") - meme correctif
+  // EXACT que tracker_dashboard.html.
+  // CORRECTIF (session, GO : "oui fait le correctif", suite a "oui ajoute ce
+  // quil faut en firmware") : le firmware a desormais un veritable etat
+  // d'armement distant pour l'axe (RemoteAxisArmed, cf.
+  // ProcessRemoteMqttCommand() cmd=="axis", fichier06 - meme cycle EXACT que
+  // RemoteRazAzArmed/RemoteRazTiltArmed/RemoteNuitArmed) : le 1er "axis" recu
+  // arme, le 2e confirme et bascule. L'ancien cablage dedie ci-dessus
+  // (wireAxisColumn(), qui n'envoyait qu'UNE SEULE commande au 2e clic)
+  // enverrait desormais une commande "axis" qui armerait seulement le
+  // firmware SANS JAMAIS le confirmer - plus aucun changement d'axe possible
+  // depuis le dashboard. Remplace par makeArmConfirmColumn(), EXACTEMENT
+  // comme razaz/raztilt/nuit ci-dessus (envoie "axis" a CHAQUE clic, armer ET
+  // confirmer) - reflet exact garanti entre le clic dashboard et le cycle
+  // firmware. Conserve au passage le correctif du bouton mort (cmd:null
+  // ci-dessus retirait l'ancien envoi qui ne partait de toute facon jamais).
+  makeArmConfirmColumn("axe", "axis", function(v){ axisArmed = v; });
+
+  // Jog directionnel : maintenir = "start" + ping toutes les 700ms
+  // (< REMOTE_JOG_WATCHDOG_MS=2000ms cote firmware), relacher = "stop".
+  var jogTimers = {};
+  document.querySelectorAll("[data-jog]").forEach(function(btn){
+    var dir = btn.getAttribute("data-jog");
+    function start(){
+      publishCmd({cmd:"jog", dir:dir, state:"start"});
+      if (jogTimers[dir]) clearInterval(jogTimers[dir]);
+      jogTimers[dir] = setInterval(function(){ publishCmd({cmd:"jog", dir:dir, state:"start"}); }, 700);
+      btn.setAttribute("fill", "var(--tft-highlight)");
+    }
+    function stop(){
+      if (jogTimers[dir]) { clearInterval(jogTimers[dir]); jogTimers[dir] = null; }
+      publishCmd({cmd:"jog", dir:dir, state:"stop"});
+      btn.setAttribute("fill", "var(--tft-bg)");
+    }
+    btn.addEventListener("mousedown",  start);
+    btn.addEventListener("touchstart", function(e){ e.preventDefault(); start(); }, {passive:false});
+    btn.addEventListener("mouseup",    stop);
+    btn.addEventListener("mouseleave", stop);
+    btn.addEventListener("touchend",   function(e){ e.preventDefault(); stop(); }, {passive:false});
+    btn.addEventListener("touchcancel",stop);
+    // AJOUT (session, GO : "aide et fonction") - port EXACT depuis
+    // tracker_dashboard.html.
+    btn.addEventListener("mouseenter", function(){ showHelp("jog_" + dir); });
+    btn.addEventListener("touchstart", function(){ showHelp("jog_" + dir); }, {passive:true});
+  });
+
+  document.querySelectorAll("[data-ldr]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      publishCmd({cmd:"ldr_offset", which:btn.getAttribute("data-ldr"), delta:parseInt(btn.getAttribute("data-delta"),10)});
+    });
+    // AJOUT (session, GO : "aide et fonction") - port EXACT depuis
+    // tracker_dashboard.html.
+    btn.addEventListener("mouseenter", function(){ showHelp("ldr_" + btn.getAttribute("data-ldr")); });
+    btn.addEventListener("touchstart", function(){ showHelp("ldr_" + btn.getAttribute("data-ldr")); }, {passive:true});
+  });
+
+  if (initial.host && initial.topic && qs.get("host")) {
+    connect();
+  }
+})();
+</script>
+</body>
+</html>
